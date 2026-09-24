@@ -151,24 +151,26 @@ fn no_ambient_skills() -> bool {
 /// 4. [`BUILTIN_SKILLS`] — the skills Claude Code ships with.
 /// 5. Claude Code's own slash commands, read from the `program` binary.
 ///
-/// Resolves the roots from the home directory; see [`discover_in`] for the
-/// injectable form the tests use.
+/// Resolves the roots from Claude Code's folder (`claudeFolder`); see
+/// [`discover_in`] for the injectable form the tests use. The personal and
+/// plugin skills need that folder. The built-in skills and the slash commands
+/// belong to the CLI, so they are listed only when `program` can be found: a
+/// palette of commands for a Claude Code that is not there helps nobody. (It
+/// is also what keeps a test harness that lets the plugin start no `claude`
+/// to the project's own skills.)
 pub(crate) fn discover(session_path: &str, program: &str) -> Vec<Skill> {
     let project = Path::new(session_path).join(".claude").join("skills");
-    let home = if no_ambient_skills() {
+    let claude_home = if no_ambient_skills() {
         None
     } else {
-        sicompass_sdk::platform::home_dir()
+        crate::claude_home::get()
     };
-    let builtins = if no_ambient_skills() {
-        ""
-    } else {
-        BUILTIN_SKILLS
-    };
-    // No home directory is not an error worth surfacing — the project skills are
+    let installed = !no_ambient_skills() && cli_exists(program);
+    let builtins = if installed { BUILTIN_SKILLS } else { "" };
+    // No folder is not an error worth surfacing — the project skills are
     // still usable on their own, and an unreadable root is simply "no skills
     // here", so an empty path costs nothing.
-    let claude_home = home.map(|h| h.join(".claude")).unwrap_or_default();
+    let claude_home = claude_home.unwrap_or_default();
     let mut out = discover_in(
         &claude_home.join("skills"),
         &project,
@@ -179,10 +181,10 @@ pub(crate) fn discover(session_path: &str, program: &str) -> Vec<Skill> {
     // follows whatever is actually there. Last, because a skill of the same name
     // is the more specific thing.
     let mut seen: HashSet<String> = out.iter().map(|s| s.name.clone()).collect();
-    let commands = if no_ambient_skills() {
-        Vec::new()
-    } else {
+    let commands = if installed {
         builtin_commands(program)
+    } else {
+        Vec::new()
     };
     for cmd in commands {
         if seen.insert(cmd.name.clone()) {
@@ -393,17 +395,17 @@ fn scan_command_literals(text: &str, out: &mut Vec<Skill>, seen: &mut HashSet<St
 
 /// Locate the bundle behind whatever `claude` the provider is configured to run.
 ///
-/// `program` is whatever the user put in the setting: a bare name to find on
-/// PATH, or a path. Symlinks are followed, and a small resolved file is treated
-/// as a launcher — Nix, for one, installs a wrapper script beside the real
-/// bundle as `.<name>-wrapped`.
+/// `program` is a bare name to find where the program would start from, or
+/// (natively) a path. Symlinks are followed, and a small resolved file is
+/// treated as a launcher — Nix, for one, installs a wrapper script beside the
+/// real bundle as `.<name>-wrapped`.
 fn resolve_bundle(program: &str) -> Option<std::path::PathBuf> {
     let direct = if program.contains(std::path::MAIN_SEPARATOR) || program.contains('/') {
         std::path::PathBuf::from(program)
     } else {
         which_on_path(program)?
     };
-    let real = std::fs::canonicalize(&direct).ok()?;
+    let real = crate::fsx::canonical(&direct)?;
     let len = std::fs::metadata(&real).ok()?.len();
     // A real bundle is tens of megabytes; anything small is a launcher.
     const LAUNCHER_MAX: u64 = 4 << 20;
@@ -418,6 +420,24 @@ fn resolve_bundle(program: &str) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Whether `program` (a name, or natively a path) is there to run.
+fn cli_exists(program: &str) -> bool {
+    if program.contains(std::path::MAIN_SEPARATOR) || program.contains('/') {
+        return Path::new(program).exists();
+    }
+    which_on_path(program).is_some()
+}
+
+/// Where the program would start from. In the sandbox the host answers
+/// (`process.which`), for the program `plugin.json` lists.
+#[cfg(target_arch = "wasm32")]
+fn which_on_path(program: &str) -> Option<std::path::PathBuf> {
+    sicompass_pdk::process::which(program)
+        .ok()
+        .map(std::path::PathBuf::from)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn which_on_path(program: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)

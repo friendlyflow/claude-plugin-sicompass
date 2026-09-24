@@ -36,38 +36,24 @@
 //! The child process lives in [`session`]; the event schema in [`events`]; the
 //! conversation state and FFON projection in [`render`].
 
+mod claude_home;
 mod events;
+mod fsx;
+mod localize;
 mod render;
 mod session;
 mod sessions;
 mod skills;
 
-pub use sessions::{_set_test_no_ambient_projects, _set_test_projects_root};
-pub use skills::_set_test_no_ambient_skills;
+#[cfg(test)]
+use sessions::_set_test_projects_root;
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
-use sicompass_sdk::localize;
-use sicompass_sdk::{
-    BuiltinManifest, FfonElement, Provider, SettingDecl, register_builtin_manifest,
-    register_provider_factory,
-};
+use sicompass_pdk::{Descriptor, FfonElement, ListItem, Plugin, PollResult, export_plugin};
 
 use render::Conversation;
 use session::{Session, SessionConfig};
-
-/// Register this crate's translation bundles with the SDK localizer.
-/// Idempotent.
-pub fn register_translations() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let _ = localize::register_bundle("en-US", include_str!("../locales/en-US.ftl"));
-        let _ = localize::register_bundle("nl-BE", include_str!("../locales/nl-BE.ftl"));
-        let _ = localize::register_bundle("fr-BE", include_str!("../locales/fr-BE.ftl"));
-        let _ = localize::register_bundle("de-BE", include_str!("../locales/de-BE.ftl"));
-    });
-}
 
 /// Cap on remembered prompts for `<input>`-slot recall.
 const HISTORY_CAP: usize = 1000;
@@ -281,10 +267,8 @@ impl ClaudeProvider {
         self.init_attempted = true;
         let resume = self.last_session_id.clone();
         let restarting = resume.is_some();
-        tracing::debug!(program = %self.program, restarting, "claude: ensure_session spawning");
         match Session::spawn(&self.session_config(resume)) {
             Ok(s) => {
-                tracing::debug!("claude: ensure_session spawn OK");
                 self.session = Some(s);
                 self.spawn_error = None;
                 if restarting {
@@ -292,7 +276,7 @@ impl ClaudeProvider {
                 }
             }
             Err(e) => {
-                tracing::error!(program = %self.program, error = %e, kind = ?e.kind(), "claude: ensure_session spawn failed");
+                log(&format!("claude: could not start {}: {e}", self.program));
                 // Name the directory as well as the reason: `:` in a folder the
                 // user cannot enter fails for a reason that belongs to *that*
                 // folder, and a bare "could not start" reads like a problem with
@@ -332,19 +316,14 @@ impl ClaudeProvider {
     /// slot" check, which special-cases this provider by name and would
     /// otherwise mistake a `+i` directory for the session's input line.
     fn list_subdirectories(&self) -> Vec<FfonElement> {
-        let Ok(read_dir) = std::fs::read_dir(&self.browse_path) else {
-            return Vec::new();
-        };
-        let mut names: Vec<String> = Vec::new();
-        for entry in read_dir.flatten() {
-            // `metadata()` follows symlinks, so a symlink pointing at a
-            // directory is offered as one — which is what `cd` would do too.
-            // Entries whose metadata can't be read (broken symlinks, races,
-            // permission holes) are skipped rather than shown as dead ends.
-            if entry.metadata().map(|m| m.is_dir()).unwrap_or(false) {
-                names.push(entry.file_name().to_string_lossy().into_owned());
-            }
-        }
+        // Symlinks are followed, so a symlink pointing at a directory is
+        // offered as one, which is what `cd` would do too. Entries that can't
+        // be read (broken symlinks, races, permission holes) are skipped
+        // rather than shown as dead ends.
+        let mut names: Vec<String> = fsx::list_dir(&self.browse_path)
+            .into_iter()
+            .filter(|name| fsx::is_dir(&self.browse_path.join(name)))
+            .collect();
         names.sort_by(|a, b| natord::compare_ignore_case(a, b));
         names
             .into_iter()
@@ -447,7 +426,6 @@ impl ClaudeProvider {
     /// only `new session` has one. The button vocabulary never leaves this
     /// crate: the app forwards the row key and learns nothing about it.
     fn activate_row(&mut self, element_key: &str) -> Option<FfonElement> {
-        register_translations();
         let name = sicompass_sdk::tags::extract_button_function_name(element_key)?;
         match name.as_str() {
             BTN_NEW_SESSION => {
@@ -477,7 +455,6 @@ impl ClaudeProvider {
 
     /// Carry out the deletion the confirmation was asking about.
     fn delete_pending(&mut self) {
-        register_translations();
         let Some(id) = self.pending_delete.take() else {
             return;
         };
@@ -540,7 +517,6 @@ impl ClaudeProvider {
     /// it true; see `no_element_is_a_childless_obj` for the invariant that still
     /// holds over the transcript.
     fn fetch_sessions(&mut self) -> Vec<FfonElement> {
-        register_translations();
         let mut listed = sessions::scan(&self.browse_path, &mut self.session_index);
         // Claude Code writes the transcript as it goes, so a session started
         // moments ago may have no file yet, or a file with no `ai-title`. Left
@@ -600,7 +576,6 @@ impl ClaudeProvider {
         self.ensure_session();
         let Some(session) = self.session.as_mut() else {
             // `ensure_session` already set a descriptive error.
-            tracing::error!(error = ?self.error, "claude: commit_edit — no session after ensure_session");
             return false;
         };
         let msg = serde_json::json!({
@@ -611,7 +586,6 @@ impl ClaudeProvider {
             },
         });
         let line = msg.to_string();
-        tracing::debug!(prompt = %prompt, "claude: writing user message to child");
         if let Err(e) = session.write_user(&line) {
             // Broken pipe → the child died; drop it so the next call re-spawns
             // with `--resume`.
@@ -650,20 +624,11 @@ impl ClaudeProvider {
             return false;
         };
         let mut changed = false;
-        let drained = session.drain_lines();
-        if !drained.is_empty() {
-            tracing::debug!(count = drained.len(), "claude: pump drained lines");
-        }
-        for line in drained {
-            match events::parse_line(&line) {
-                Some(ev) => {
-                    self.convo.apply(ev);
-                    changed = true;
-                }
-                None => {
-                    let preview: String = line.chars().take(120).collect();
-                    tracing::debug!(line = %preview, "claude: pump could not parse line");
-                }
+        // A line that is not an event this understands is skipped.
+        for line in session.drain_lines() {
+            if let Some(ev) = events::parse_line(&line) {
+                self.convo.apply(ev);
+                changed = true;
             }
         }
         if let Some(sid) = &self.convo.session_id {
@@ -672,8 +637,14 @@ impl ClaudeProvider {
         // Unexpected child exit: surface stderr, drop the session, and allow a
         // `--resume` re-spawn on the next `ensure_session()`.
         if !session.is_alive() {
+            // Whatever it wrote between the drain above and its exit.
+            for line in session.drain_lines() {
+                if let Some(ev) = events::parse_line(&line) {
+                    self.convo.apply(ev);
+                }
+            }
             let stderr = session.take_stderr();
-            tracing::error!(stderr = %stderr.trim(), "claude: child exited unexpectedly");
+            log(&format!("claude: the CLI exited: {}", stderr.trim()));
             self.session = None;
             self.init_attempted = false;
             self.convo.busy = false;
@@ -694,35 +665,25 @@ impl ClaudeProvider {
     }
 }
 
-impl Provider for ClaudeProvider {
-    fn name(&self) -> &str {
+// ---------------------------------------------------------------------------
+// What the plugin trait does not have: the answers `poll` batches, and the
+// calls in the shape the tests drive them.
+// ---------------------------------------------------------------------------
+
+impl ClaudeProvider {
+    pub fn name(&self) -> &str {
         "claude"
     }
 
-    fn display_name(&self) -> String {
-        register_translations();
+    pub fn display_name(&self) -> String {
         localize::t("claude-display-name")
     }
 
-    /// Start at the filesystem root in the browse view. `claude` is *not*
-    /// spawned here — that happens on the first `:` (see [`Self::enter_session`]),
-    /// so a claude tab the user only browses never starts a process.
-    fn init(&mut self) {
-        self.view = View::Browse;
-        self.browse_path = PathBuf::from("/");
-    }
-
-    fn cleanup(&mut self) {
-        // Dropping the Session kills the child (Session::Drop).
-        self.session = None;
-        self.init_attempted = false;
-        self.spawn_error = None;
-    }
-
-    /// OS process id of the child, if started. `None` until the first `:`, so
-    /// the tab-switcher label falls back gracefully.
+    /// OS process id of the child, if started (natively; inside the sandbox
+    /// the host reports it to the tab switcher itself).
+    #[cfg(test)]
     fn process_id(&self) -> Option<u32> {
-        self.session.as_ref().map(|s| s.pid())
+        self.session.as_ref().and_then(|s| s.pid())
     }
 
     /// Busy while a turn is in flight. The app uses this to confirm before
@@ -732,118 +693,8 @@ impl Provider for ClaudeProvider {
         self.convo.busy
     }
 
-    fn fetch(&mut self) -> Vec<FfonElement> {
-        match self.view {
-            View::Browse => self.list_subdirectories(),
-            View::Sessions => self.fetch_sessions(),
-            View::Session => self.fetch_session(),
-        }
-    }
-
-    // ---- Directory browsing ---------------------------------------------
-    //
-    // Same contract as the file browser, so the app's generic navigation does
-    // all the work: Right pushes a segment and re-`fetch()`es, Left pops. The
-    // path methods are inert in the session view — the cursor is inside the
-    // conversation there, and moving `browse_path` under it would send the next
-    // `:` somewhere the user never asked for.
-
-    fn push_path(&mut self, segment: &str) {
-        if self.view != View::Browse {
-            return;
-        }
-        self.browse_path
-            .push(segment.trim_end_matches('/').trim_end_matches('\\'));
-    }
-
-    fn pop_path(&mut self) {
-        if self.view != View::Browse {
-            return;
-        }
-        if self.browse_path.parent().is_some() && self.browse_path != Path::new("/") {
-            self.browse_path.pop();
-        }
-    }
-
-    /// Where the provider currently is: the folder being listed while browsing,
-    /// and the folder the *session* is running in while it is up.
-    ///
-    /// This is what the app persists on close, so the session answer has to name
-    /// the directory `claude` was actually spawned into. Until a first `:` has
-    /// succeeded `session_path` is empty, which would send the app's
-    /// rebuild-from-root walk nowhere — fall back to the browse path.
-    fn current_path(&self) -> &str {
-        match self.view {
-            // The list describes the folder being browsed, so the app's
-            // rebuild-from-root walk still lands on that folder's level.
-            View::Browse | View::Sessions => self.browse_path.to_str().unwrap_or("/"),
-            View::Session if self.session_path.is_empty() => {
-                self.browse_path.to_str().unwrap_or("/")
-            }
-            View::Session => &self.session_path,
-        }
-    }
-
-    fn set_current_path(&mut self, path: &str) {
-        self.browse_path = PathBuf::from(path);
-    }
-
-    fn path_is_filesystem(&self) -> bool {
-        true
-    }
-
     fn at_root(&self) -> bool {
         self.browse_path == Path::new("/")
-    }
-
-    fn commit_edit(&mut self, old: &str, new: &str) -> bool {
-        tracing::debug!(old_len = old.len(), new = %new, "claude: commit_edit called");
-        // The session list's first-prompt row, which the `new session` button
-        // opened. Ahead of both rejections below, and on purpose: the view is
-        // `Sessions` rather than `Session`, and a re-edit of the row arrives
-        // with a non-empty `old`. It is the only editable row that level has,
-        // so no further test is needed to recognise it.
-        if self.view == View::Sessions {
-            let prompt = new.trim().to_owned();
-            if prompt.is_empty() {
-                // Refusing leaves the cursor in the row to try again, rather
-                // than starting a session with nothing to say.
-                return false;
-            }
-            self.start_new_session();
-            if !self.send_prompt(&prompt) {
-                // The child did not start. The swap still happened and
-                // `spawn_error` is already on screen above the slot, so report
-                // success: landing in the session with the reason showing beats
-                // leaving the user in a list with an unexplained refusal. The
-                // prompt goes back into the slot rather than being thrown away.
-                self.pending_input = prompt;
-            }
-            return true;
-        }
-        // Browsing is read-only: reject the `i` placeholder the app seeds into
-        // an empty directory rather than turning it into a file-creation path.
-        if self.view != View::Session {
-            tracing::debug!("claude: commit_edit rejected — not in the session view");
-            return false;
-        }
-        // The handler strips the `<input>...</input>` wrapper before calling
-        // us, so the trailing live slot arrives with `old == ""`. Reject any
-        // non-empty `old` (editing a past conversation line is not supported).
-        if !old.is_empty() {
-            tracing::debug!("claude: commit_edit rejected — non-empty `old`");
-            return false;
-        }
-        let prompt = new.trim().to_owned();
-        if prompt.is_empty() {
-            tracing::debug!("claude: commit_edit rejected — empty prompt");
-            return false;
-        }
-        self.send_prompt(&prompt)
-    }
-
-    fn set_input_value(&mut self, value: &str) {
-        self.pending_input = value.to_owned();
     }
 
     fn tick(&mut self) -> bool {
@@ -867,50 +718,6 @@ impl Provider for ClaudeProvider {
     /// as an error and would read as one.
     fn take_announcement(&mut self) -> Option<String> {
         self.announcement.take()
-    }
-
-    fn no_cache(&self) -> bool {
-        true
-    }
-
-    // ---- Commands --------------------------------------------------------
-    //
-    // For this provider the app routes `:` straight to `handle_command`, rather
-    // than opening the command palette, so these are normally invoked without
-    // the list ever being drawn. They are still implemented properly: the WASM
-    // plugin bridge and the tests reach the provider through the generic command
-    // path, and `commands()` is what tells the app which of the two transitions
-    // is currently available — that is how the app decides whether `:` should
-    // enter or leave the session without querying view state.
-
-    /// `CMD_BROWSE` stays **first** in the session arm. The app reads
-    /// "am I in the session view?" as "does this contain `browse`?", which is
-    /// order-independent, but the one place that reads `.next()` — the `:`
-    /// handler deciding which transition to fire — is only safe because it
-    /// early-returns inside a session. Leading with the view swap costs nothing
-    /// and removes the trap.
-    fn commands(&self) -> Vec<String> {
-        match self.view {
-            View::Browse => vec![CMD_SESSIONS.to_owned()],
-            View::Sessions => vec![CMD_BROWSE.to_owned(), CMD_SESSIONS.to_owned()],
-            View::Session => vec![
-                CMD_BROWSE.to_owned(),
-                CMD_SESSIONS.to_owned(),
-                CMD_SKILLS.to_owned(),
-            ],
-        }
-    }
-
-    fn command_label(&self, cmd: &str) -> String {
-        register_translations();
-        match cmd {
-            CMD_SESSION => localize::t("claude-command-session"),
-            CMD_SESSIONS => localize::t("claude-command-sessions"),
-            CMD_DELETE_SESSION => localize::t("claude-command-delete-session"),
-            CMD_BROWSE => localize::t("claude-command-browse"),
-            CMD_SKILLS => localize::t("claude-command-skills"),
-            other => other.to_owned(),
-        }
     }
 
     fn handle_command(
@@ -969,14 +776,236 @@ impl Provider for ClaudeProvider {
         // toggle and refreshes the current level, which is exactly the view swap.
         None
     }
+}
 
-    fn command_list_items(&self, command: &str) -> Vec<sicompass_sdk::provider::ListItem> {
+// ---------------------------------------------------------------------------
+// Plugin impl
+// ---------------------------------------------------------------------------
+
+impl Plugin for ClaudeProvider {
+    fn new() -> Self {
+        ClaudeProvider::new()
+    }
+
+    fn describe(&self) -> Descriptor {
+        Descriptor {
+            name: self.name().to_owned(),
+            display_name: self.display_name(),
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            path_is_filesystem: true,
+            // The conversation changes under the app on every streamed token.
+            no_cache: true,
+            ..Default::default()
+        }
+    }
+
+    /// Everything the app asks each frame: streamed events, whether a turn is
+    /// in flight, and what to report.
+    fn poll(&mut self) -> PollResult {
+        let redraw = self.tick();
+        PollResult {
+            redraw,
+            is_busy: self.is_busy(),
+            at_root: self.at_root(),
+            error: self.take_error(),
+            announcement: self.take_announcement(),
+            ..Default::default()
+        }
+    }
+
+    /// Start at the filesystem root in the browse view. `claude` is *not*
+    /// spawned here — that happens on the first `:` (see [`Self::enter_session`]),
+    /// so a claude tab the user only browses never starts a process.
+    fn init(&mut self) {
+        self.view = View::Browse;
+        self.browse_path = PathBuf::from("/");
+        // The settings `plugin.json` declares, from the host. (The unit tests
+        // set them through `on_setting_change`.)
+        #[cfg(target_arch = "wasm32")]
+        for key in [
+            SETTING_FOLDER,
+            "claudePermissionMode",
+            "claudeModel",
+            "claudeExtraArgs",
+            "claudeStreamPartial",
+        ] {
+            if let Some(v) = sicompass_pdk::host::get_setting(key) {
+                self.on_setting_change(key, &v);
+            }
+        }
+    }
+
+    fn cleanup(&mut self) {
+        // Dropping the Session kills the child (Session::Drop).
+        self.session = None;
+        self.init_attempted = false;
+        self.spawn_error = None;
+    }
+
+    fn fetch(&mut self) -> Vec<FfonElement> {
+        match self.view {
+            View::Browse => self.list_subdirectories(),
+            View::Sessions => self.fetch_sessions(),
+            View::Session => self.fetch_session(),
+        }
+    }
+
+    // ---- Directory browsing ---------------------------------------------
+    //
+    // Same contract as the file browser, so the app's generic navigation does
+    // all the work: Right pushes a segment and re-`fetch()`es, Left pops. The
+    // path methods are inert in the session view — the cursor is inside the
+    // conversation there, and moving `browse_path` under it would send the next
+    // `:` somewhere the user never asked for.
+
+    fn push_path(&mut self, segment: &str) {
+        if self.view != View::Browse {
+            return;
+        }
+        self.browse_path
+            .push(segment.trim_end_matches('/').trim_end_matches('\\'));
+    }
+
+    fn pop_path(&mut self) {
+        if self.view != View::Browse {
+            return;
+        }
+        if self.browse_path.parent().is_some() && self.browse_path != Path::new("/") {
+            self.browse_path.pop();
+        }
+    }
+
+    /// Where the provider currently is: the folder being listed while browsing,
+    /// and the folder the *session* is running in while it is up.
+    ///
+    /// This is what the app persists on close, so the session answer has to name
+    /// the directory `claude` was actually spawned into. Until a first `:` has
+    /// succeeded `session_path` is empty, which would send the app's
+    /// rebuild-from-root walk nowhere — fall back to the browse path.
+    fn current_path(&self) -> &str {
+        match self.view {
+            // The list describes the folder being browsed, so the app's
+            // rebuild-from-root walk still lands on that folder's level.
+            View::Browse | View::Sessions => self.browse_path.to_str().unwrap_or("/"),
+            View::Session if self.session_path.is_empty() => {
+                self.browse_path.to_str().unwrap_or("/")
+            }
+            View::Session => &self.session_path,
+        }
+    }
+
+    fn set_current_path(&mut self, path: &str) {
+        self.browse_path = PathBuf::from(path);
+    }
+
+    fn commit_edit(&mut self, old: &str, new: &str) -> bool {
+        // The session list's first-prompt row, which the `new session` button
+        // opened. Ahead of both rejections below, and on purpose: the view is
+        // `Sessions` rather than `Session`, and a re-edit of the row arrives
+        // with a non-empty `old`. It is the only editable row that level has,
+        // so no further test is needed to recognise it.
+        if self.view == View::Sessions {
+            let prompt = new.trim().to_owned();
+            if prompt.is_empty() {
+                // Refusing leaves the cursor in the row to try again, rather
+                // than starting a session with nothing to say.
+                return false;
+            }
+            self.start_new_session();
+            if !self.send_prompt(&prompt) {
+                // The child did not start. The swap still happened and
+                // `spawn_error` is already on screen above the slot, so report
+                // success: landing in the session with the reason showing beats
+                // leaving the user in a list with an unexplained refusal. The
+                // prompt goes back into the slot rather than being thrown away.
+                self.pending_input = prompt;
+            }
+            return true;
+        }
+        // Browsing is read-only: reject the `i` placeholder the app seeds into
+        // an empty directory rather than turning it into a file-creation path.
+        if self.view != View::Session {
+            return false;
+        }
+        // The handler strips the `<input>...</input>` wrapper before calling
+        // us, so the trailing live slot arrives with `old == ""`. Reject any
+        // non-empty `old` (editing a past conversation line is not supported).
+        if !old.is_empty() {
+            return false;
+        }
+        let prompt = new.trim().to_owned();
+        if prompt.is_empty() {
+            return false;
+        }
+        self.send_prompt(&prompt)
+    }
+
+    fn set_input_value(&mut self, value: &str) {
+        self.pending_input = value.to_owned();
+    }
+
+    // ---- Commands --------------------------------------------------------
+    //
+    // For this provider the app routes `:` straight to `handle_command`, rather
+    // than opening the command palette, so these are normally invoked without
+    // the list ever being drawn. They are still implemented properly: the WASM
+    // plugin bridge and the tests reach the provider through the generic command
+    // path, and `commands()` is what tells the app which of the two transitions
+    // is currently available — that is how the app decides whether `:` should
+    // enter or leave the session without querying view state.
+
+    /// `CMD_BROWSE` stays **first** in the session arm. The app reads
+    /// "am I in the session view?" as "does this contain `browse`?", which is
+    /// order-independent, but the one place that reads `.next()` — the `:`
+    /// handler deciding which transition to fire — is only safe because it
+    /// early-returns inside a session. Leading with the view swap costs nothing
+    /// and removes the trap.
+    fn commands(&self) -> Vec<String> {
+        match self.view {
+            View::Browse => vec![CMD_SESSIONS.to_owned()],
+            View::Sessions => vec![CMD_BROWSE.to_owned(), CMD_SESSIONS.to_owned()],
+            View::Session => vec![
+                CMD_BROWSE.to_owned(),
+                CMD_SESSIONS.to_owned(),
+                CMD_SKILLS.to_owned(),
+            ],
+        }
+    }
+
+    fn command_label(&self, cmd: &str) -> String {
+        match cmd {
+            CMD_SESSION => localize::t("claude-command-session"),
+            CMD_SESSIONS => localize::t("claude-command-sessions"),
+            CMD_DELETE_SESSION => localize::t("claude-command-delete-session"),
+            CMD_BROWSE => localize::t("claude-command-browse"),
+            CMD_SKILLS => localize::t("claude-command-skills"),
+            other => other.to_owned(),
+        }
+    }
+
+    fn handle_command(
+        &mut self,
+        command: &str,
+        element_key: &str,
+        element_type: i32,
+    ) -> Result<Option<FfonElement>, String> {
+        let mut error = String::new();
+        let out =
+            ClaudeProvider::handle_command(self, command, element_key, element_type, &mut error);
+        if error.is_empty() {
+            Ok(out)
+        } else {
+            Err(error)
+        }
+    }
+
+    fn command_list_items(&self, command: &str) -> Vec<ListItem> {
         if command != CMD_SKILLS {
             return Vec::new();
         }
         self.skills
             .iter()
-            .map(|s| sicompass_sdk::provider::ListItem {
+            .map(|s| ListItem {
                 // Human text in `label`, payload in `data` — the shape the file
                 // browser's "open file with" uses.
                 //
@@ -1008,11 +1037,7 @@ impl Provider for ClaudeProvider {
         // All settings take effect on the next spawn — a live session is not
         // hot-restarted.
         match key {
-            "claudeBinary" => {
-                if !value.is_empty() {
-                    self.program = value.to_owned();
-                }
-            }
+            SETTING_FOLDER => claude_home::set(value),
             "claudePermissionMode" => {
                 if !value.is_empty() {
                     self.permission_mode = value.to_owned();
@@ -1036,29 +1061,18 @@ impl Provider for ClaudeProvider {
     }
 }
 
-/// Register the Claude provider with the SDK factory and manifest registries.
-pub fn register() {
-    register_translations();
-    register_provider_factory("claude", || Box::new(ClaudeProvider::new()));
-    register_builtin_manifest(BuiltinManifest::new("claude", "claude").with_settings(vec![
-        SettingDecl::text("claude", "claude binary path", "claudeBinary", "claude"),
-        SettingDecl::radio(
-            "claude",
-            "permission mode",
-            "claudePermissionMode",
-            &["default", "acceptEdits", "plan", "bypassPermissions"],
-            "default",
-        ),
-        SettingDecl::text("claude", "model override", "claudeModel", ""),
-        SettingDecl::text("claude", "extra CLI args", "claudeExtraArgs", ""),
-        SettingDecl::checkbox(
-            "claude",
-            "stream responses token-by-token",
-            "claudeStreamPartial",
-            true,
-        ),
-    ]));
+/// The setting (declared in `plugin.json`) naming Claude Code's own folder.
+const SETTING_FOLDER: &str = "claudeFolder";
+
+/// A diagnostic line in the host's log.
+fn log(msg: &str) {
+    #[cfg(target_arch = "wasm32")]
+    sicompass_pdk::host::log(msg);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = msg;
 }
+
+export_plugin!(ClaudeProvider);
 
 #[cfg(test)]
 mod tests {
@@ -1145,14 +1159,12 @@ mod tests {
 
     #[test]
     fn no_cache_is_true() {
-        assert!(ClaudeProvider::new().no_cache());
+        assert!(ClaudeProvider::new().describe().no_cache);
     }
 
     #[test]
     fn on_setting_change_updates_config() {
         let mut p = ClaudeProvider::new();
-        p.on_setting_change("claudeBinary", "/opt/claude");
-        assert_eq!(p.program, "/opt/claude");
         p.on_setting_change("claudePermissionMode", "plan");
         assert_eq!(p.permission_mode, "plan");
         p.on_setting_change("claudeModel", "claude-opus-4-7");
@@ -1166,9 +1178,7 @@ mod tests {
         assert!(!p.include_partial);
         p.on_setting_change("claudeStreamPartial", "true");
         assert!(p.include_partial);
-        // Empty / unknown keys are ignored.
-        p.on_setting_change("claudeBinary", "");
-        assert_eq!(p.program, "/opt/claude");
+        // Unknown keys are ignored.
         p.on_setting_change("unrelated", "x");
     }
 
@@ -1401,7 +1411,7 @@ mod tests {
 
     #[test]
     fn path_is_filesystem_so_the_app_walks_it_as_directories() {
-        assert!(ClaudeProvider::new().path_is_filesystem());
+        assert!(ClaudeProvider::new().describe().path_is_filesystem);
     }
 
     // ---- View swapping ----------------------------------------------------
@@ -1763,14 +1773,6 @@ mod tests {
         assert!(ClaudeProvider::new().process_id().is_none());
     }
 
-    #[test]
-    fn register_makes_factory_available() {
-        register();
-        let p = sicompass_sdk::create_provider_by_name("claude");
-        assert!(p.is_some());
-        assert_eq!(p.unwrap().name(), "claude");
-    }
-
     // ---- The session list ------------------------------------------------
 
     #[test]
@@ -1827,7 +1829,7 @@ mod tests {
         let mut ids: Vec<String> = out
             .iter()
             .skip(1)
-            .filter_map(|e| sicompass_sdk::tags::extract_id(&row_key(&[e.clone()], 0)))
+            .filter_map(|e| sicompass_sdk::tags::extract_id(&row_key(std::slice::from_ref(e), 0)))
             .collect();
         ids.sort();
         assert_eq!(ids, vec!["s1", "s2"], "identity travels with the row");

@@ -1,6 +1,12 @@
 # Claude provider strings — Belgian French.
 
 claude-display-name = claude
+claude-description = Claude Code sous forme de liste : choisissez un dossier, appuyez sur : pour ses sessions, et lisez chaque réponse, appel d'outil et résultat ligne par ligne. Utilise la commande claude que vous avez déjà, avec sa propre connexion.
+claude-radio-permission-mode = mode d'autorisation
+claude-setting-model = autre modèle
+claude-setting-extra-args = arguments CLI supplémentaires
+claude-checkbox-stream-partial = afficher les réponses jeton par jeton
+claude-setting-folder = dossier de Claude Code (sessions et compétences)
 
 # Noms de commande affichés partout où les commandes du fournisseur sont listées.
 claude-command-session = session

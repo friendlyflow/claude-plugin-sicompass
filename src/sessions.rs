@@ -99,7 +99,7 @@ pub(crate) fn projects_root() -> Option<PathBuf> {
     if NO_AMBIENT_PROJECTS.load(std::sync::atomic::Ordering::Acquire) {
         return None;
     }
-    sicompass_sdk::platform::home_dir().map(|h| h.join(".claude").join("projects"))
+    crate::claude_home::get().map(|h| h.join("projects"))
 }
 
 /// Claude Code's directory name for a working directory: every character that

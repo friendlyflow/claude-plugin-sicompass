@@ -1,6 +1,12 @@
 # Claude provider strings — Belgian German (Eastern Cantons).
 
 claude-display-name = claude
+claude-description = Claude Code als Liste: einen Ordner wählen, : für seine Sitzungen drücken, und jede Antwort, jeden Tool-Aufruf und jedes Ergebnis Zeile für Zeile lesen. Verwendet den claude-Befehl, den Sie schon haben, mit dessen eigener Anmeldung.
+claude-radio-permission-mode = Berechtigungsmodus
+claude-setting-model = anderes Modell
+claude-setting-extra-args = zusätzliche CLI-Argumente
+claude-checkbox-stream-partial = Antworten Token für Token anzeigen
+claude-setting-folder = Ordner von Claude Code (Sitzungen und Skills)
 
 # Befehlsnamen, die überall dort erscheinen, wo die Befehle des Providers
 # aufgelistet werden.

@@ -155,10 +155,10 @@ impl Conversation {
             StreamEvent::Partial(p) => match p.event {
                 PartialInner::ContentBlockStart { content_block } => {
                     self.partial.active = true;
-                    if content_block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                        if let Some(name) = content_block.get("name").and_then(|n| n.as_str()) {
-                            self.partial.tools.push(name.to_owned());
-                        }
+                    if content_block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                        && let Some(name) = content_block.get("name").and_then(|n| n.as_str())
+                    {
+                        self.partial.tools.push(name.to_owned());
                     }
                 }
                 PartialInner::ContentBlockDelta { delta } => {
@@ -182,10 +182,10 @@ impl Conversation {
     /// turns; falls back to the raw id when no match is found.
     fn tool_name_for(&self, tool_use_id: &str) -> String {
         for turn in self.turns.iter().rev() {
-            if let Turn::Assistant { tools, .. } = turn {
-                if let Some(t) = tools.iter().find(|t| t.id == tool_use_id) {
-                    return t.name.clone();
-                }
+            if let Turn::Assistant { tools, .. } = turn
+                && let Some(t) = tools.iter().find(|t| t.id == tool_use_id)
+            {
+                return t.name.clone();
             }
         }
         tool_use_id.to_owned()
@@ -355,10 +355,9 @@ pub fn build(convo: &Conversation, pending_input: &str) -> Vec<FfonElement> {
             is_error,
             ..
         } = turn
+            && used_ids.contains(tool_use_id.as_str())
         {
-            if used_ids.contains(tool_use_id.as_str()) {
-                results.insert(tool_use_id.as_str(), (summary.as_str(), *is_error));
-            }
+            results.insert(tool_use_id.as_str(), (summary.as_str(), *is_error));
         }
     }
 

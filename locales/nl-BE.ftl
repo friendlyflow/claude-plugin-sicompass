@@ -1,6 +1,12 @@
 # Claude provider strings — Belgian Dutch (Flemish).
 
 claude-display-name = claude
+claude-description = Claude Code als lijst: kies een map, druk : voor haar sessies, en lees elk antwoord, elke toolaanroep en elk resultaat rij per rij. Gebruikt het claude-commando dat je al hebt, met zijn eigen login.
+claude-radio-permission-mode = toestemmingsmodus
+claude-setting-model = ander model
+claude-setting-extra-args = extra CLI-argumenten
+claude-checkbox-stream-partial = antwoorden token per token tonen
+claude-setting-folder = map van Claude Code (sessies en skills)
 
 # Commandonamen, getoond waar de commando's van de provider opgesomd worden.
 claude-command-session = sessie

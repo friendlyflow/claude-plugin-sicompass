@@ -1,6 +1,12 @@
 # Claude provider strings — English (source/fallback).
 
 claude-display-name = claude
+claude-description = Claude Code as a list: pick a folder, press : for its sessions, and read every answer, tool call and result row by row. Runs the claude command you already have, with its own login.
+claude-radio-permission-mode = permission mode
+claude-setting-model = model override
+claude-setting-extra-args = extra CLI args
+claude-checkbox-stream-partial = stream responses token-by-token
+claude-setting-folder = Claude Code's folder (its sessions and skills)
 
 # Command names shown wherever the provider's commands are listed. `session`
 # swaps the folder listing for the claude session, `browse` swaps back.

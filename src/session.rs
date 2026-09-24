@@ -1,22 +1,20 @@
 //! Child-process management for a streaming `claude` session.
 //!
-//! Mirrors the background-reader-thread pattern of `sicompass-shell`'s `Shell`,
-//! but uses **plain pipes** (`std::process::Command`) rather than a PTY:
-//! `stream-json` wants a clean newline-delimited byte stream, not a terminal
-//! grid. A reader thread blocks on `BufReader::read_line` so the synchronous
-//! `Provider` methods only ever do non-blocking drains.
+//! **Plain pipes** rather than a PTY: `stream-json` wants a clean
+//! newline-delimited byte stream, not a terminal grid. Inside the sandbox the
+//! host runs the CLI (`process`, which `plugin.json` asks for) and its reads
+//! never block. Natively, for the unit tests, `std::process` with a reader
+//! thread that blocks on `BufReader::read_line`. Either way the plugin's
+//! methods only ever do non-blocking drains.
 
-use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
 
 /// How to spawn the `claude` child process.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
-    /// `claude` binary — a bare name (PATH-searched) or an absolute path.
+    /// The `claude` program: in the sandbox the name `plugin.json` lists
+    /// (the host finds it on `PATH` or in `~/.local/bin`), natively a name or
+    /// a path.
     pub program: String,
     /// `--permission-mode` value: default | acceptEdits | plan | bypassPermissions.
     pub permission_mode: String,
@@ -46,10 +44,144 @@ impl Default for SessionConfig {
     }
 }
 
+/// The command line for `cfg`, after the program.
+fn args(cfg: &SessionConfig) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--input-format",
+        "stream-json",
+        "--verbose",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    if cfg.include_partial {
+        args.push("--include-partial-messages".to_owned());
+    }
+    args.push("--permission-mode".to_owned());
+    args.push(cfg.permission_mode.clone());
+    if let Some(model) = cfg.model.as_ref().filter(|m| !m.is_empty()) {
+        args.push("--model".to_owned());
+        args.push(model.clone());
+    }
+    if let Some(resume) = cfg.resume.as_ref().filter(|r| !r.is_empty()) {
+        args.push("--resume".to_owned());
+        args.push(resume.clone());
+    }
+    args.extend(cfg.extra_args.iter().cloned());
+    args
+}
+
+// ---------------------------------------------------------------------------
+// In the sandbox: the host's pipes
+// ---------------------------------------------------------------------------
+
+/// A running `claude --output-format stream-json`. Dropping it drops the
+/// host resource, which kills the program.
+#[cfg(target_arch = "wasm32")]
+pub struct Session {
+    child: sicompass_pdk::process::Child,
+    /// The unfinished line at the end of what has been read.
+    partial: std::cell::RefCell<Vec<u8>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Session {
+    pub fn spawn(cfg: &SessionConfig) -> std::io::Result<Session> {
+        let cwd = cfg.cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
+        let child = sicompass_pdk::process::Child::spawn(
+            &cfg.program,
+            &args(cfg),
+            cwd.as_deref(),
+            &[],
+            &[],
+            None,
+        )
+        .map_err(|e| {
+            // The host says why; a program it cannot find reads as NotFound,
+            // as a spawn outside the sandbox would.
+            let kind = if e.contains("not found") {
+                std::io::ErrorKind::NotFound
+            } else {
+                std::io::ErrorKind::Other
+            };
+            std::io::Error::new(kind, e)
+        })?;
+        Ok(Session {
+            child,
+            partial: std::cell::RefCell::new(Vec::new()),
+        })
+    }
+
+    /// Take all complete JSONL lines that arrived since the last call.
+    pub fn drain_lines(&self) -> Vec<String> {
+        let mut partial = self.partial.borrow_mut();
+        loop {
+            let chunk = self.child.read(1 << 20);
+            if chunk.is_empty() {
+                break;
+            }
+            partial.extend(chunk);
+        }
+        let Some(end) = partial.iter().rposition(|b| *b == b'\n') else {
+            return Vec::new();
+        };
+        let complete: Vec<u8> = partial.drain(..=end).collect();
+        String::from_utf8_lossy(&complete)
+            .lines()
+            .map(|l| l.trim_end_matches('\r'))
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Take all stderr text that arrived so far.
+    pub fn take_stderr(&self) -> String {
+        let mut out = Vec::new();
+        loop {
+            let chunk = self.child.read_stderr(1 << 20);
+            if chunk.is_empty() {
+                break;
+            }
+            out.extend(chunk);
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Write one JSONL user message to the child's stdin.
+    pub fn write_user(&mut self, json_line: &str) -> std::io::Result<()> {
+        let mut bytes = json_line.as_bytes().to_vec();
+        bytes.push(b'\n');
+        self.child.write(&bytes).map_err(std::io::Error::other)
+    }
+
+    /// `true` until the child has exited and its output has all arrived.
+    pub fn is_alive(&mut self) -> bool {
+        self.child.try_wait().is_none()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Natively, for the tests: std::process
+// ---------------------------------------------------------------------------
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::{BufRead, BufReader, Write};
+#[cfg(not(target_arch = "wasm32"))]
+use std::process::{Child, ChildStdin, Command, Stdio};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Arc, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
+use std::thread;
+
 /// A spawned `claude --output-format stream-json` process.
 ///
 /// `drain_lines()` is non-blocking and returns whatever complete JSONL lines
 /// the background reader thread has buffered since the previous call.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct Session {
     child: Child,
     stdin: ChildStdin,
@@ -58,59 +190,19 @@ pub struct Session {
     alive: Arc<AtomicBool>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Session {
     /// Spawn `cfg.program` in streaming-JSON mode with piped stdio.
     pub fn spawn(cfg: &SessionConfig) -> std::io::Result<Session> {
-        tracing::debug!(
-            program = %cfg.program,
-            permission_mode = %cfg.permission_mode,
-            model = ?cfg.model,
-            cwd = ?cfg.cwd,
-            resume = ?cfg.resume,
-            include_partial = cfg.include_partial,
-            "claude: Session::spawn"
-        );
-        let mut cmd = new_command(&cfg.program)?;
-        cmd.args([
-            "--print",
-            "--output-format",
-            "stream-json",
-            "--input-format",
-            "stream-json",
-            "--verbose",
-        ]);
-        if cfg.include_partial {
-            cmd.arg("--include-partial-messages");
-        }
-        cmd.args(["--permission-mode", &cfg.permission_mode]);
-        if let Some(model) = &cfg.model {
-            if !model.is_empty() {
-                cmd.args(["--model", model]);
-            }
-        }
-        if let Some(resume) = &cfg.resume {
-            if !resume.is_empty() {
-                cmd.args(["--resume", resume]);
-            }
-        }
-        for arg in &cfg.extra_args {
-            cmd.arg(arg);
-        }
+        let mut cmd = Command::new(&cfg.program);
+        cmd.args(args(cfg));
         if let Some(cwd) = &cfg.cwd {
             cmd.current_dir(cwd);
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(program = %cfg.program, error = %e, kind = ?e.kind(), "claude: spawn failed");
-                return Err(e);
-            }
-        };
-        tracing::debug!(pid = child.id(), "claude: child spawned");
+        let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
@@ -130,16 +222,15 @@ impl Session {
                 loop {
                     buf.clear();
                     match reader.read_line(&mut buf) {
-                        Ok(0) => break,
+                        Ok(0) | Err(_) => break,
                         Ok(_) => {
                             let line = buf.trim_end_matches(['\r', '\n']).to_owned();
-                            if !line.is_empty() {
-                                if let Ok(mut l) = lines.lock() {
-                                    l.push(line);
-                                }
+                            if !line.is_empty()
+                                && let Ok(mut l) = lines.lock()
+                            {
+                                l.push(line);
                             }
                         }
-                        Err(_) => break,
                     }
                 }
                 alive.store(false, Ordering::SeqCst);
@@ -155,13 +246,12 @@ impl Session {
                 loop {
                     buf.clear();
                     match reader.read_line(&mut buf) {
-                        Ok(0) => break,
+                        Ok(0) | Err(_) => break,
                         Ok(_) => {
                             if let Ok(mut s) = stderr_buf.lock() {
                                 s.push_str(&buf);
                             }
                         }
-                        Err(_) => break,
                     }
                 }
             });
@@ -208,13 +298,11 @@ impl Session {
         !matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
-    /// OS process id of the child, for the tab-switcher label.
-    ///
-    /// A method rather than a stored field on purpose: `Child::id()` is
-    /// infallible and always current, and adding a field here would break the
-    /// hand-built `Session` literal in this module's round-trip test.
-    pub fn pid(&self) -> u32 {
-        self.child.id()
+    /// OS process id of the child. (Inside the sandbox the host reports it
+    /// to the tab switcher itself.)
+    #[cfg(test)]
+    pub fn pid(&self) -> Option<u32> {
+        Some(self.child.id())
     }
 
     /// Kill the child and reap it.
@@ -225,156 +313,14 @@ impl Session {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for Session {
     fn drop(&mut self) {
         self.kill();
     }
 }
 
-/// Build the `Command` used to launch the `claude` CLI.
-///
-/// On Unix a bare `Command::new` is enough. On Windows it is not: npm installs
-/// the CLI as a batch shim `claude.cmd` (the native installer as `claude.exe`),
-/// but Rust's `Command` only appends `.exe` when PATH-searching a bare name, so
-/// `claude.cmd` is invisible and the spawn fails with `NotFound`. We resolve the
-/// name against `PATHEXT` ourselves and hand the full path to `Command::new`;
-/// for a `.cmd`/`.bat` shim std then routes through `cmd.exe` with hardened
-/// argument escaping. We also set `CREATE_NO_WINDOW` so launching the shim from
-/// a TUI app doesn't flash a console window.
-#[cfg(not(windows))]
-fn new_command(program: &str) -> std::io::Result<Command> {
-    Ok(Command::new(program))
-}
-
-#[cfg(windows)]
-fn new_command(program: &str) -> std::io::Result<Command> {
-    use std::os::windows::process::CommandExt;
-    /// Suppress the console window a batch shim would otherwise pop up.
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    let resolved = resolve_windows_program(program).ok_or_else(|| {
-        tracing::error!(
-            program,
-            "claude: resolve_windows_program found nothing on PATH/PATHEXT"
-        );
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("`{program}` not found on PATH"),
-        )
-    })?;
-    tracing::debug!(program, resolved = %resolved.display(), "claude: resolved windows program");
-    let mut cmd = Command::new(resolved);
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    Ok(cmd)
-}
-
-/// Resolve a Windows program name to a concrete executable path, honoring
-/// `PATHEXT`. Bare names are searched on `PATH`; names containing a separator
-/// (or an absolute path) are tried as given. In both cases, when the name has
-/// no extension we also try each `PATHEXT` suffix (`.CMD`, `.EXE`, …) so npm's
-/// `claude.cmd` shim is found.
-///
-/// When the `PATH` search comes up empty for a bare name, we also probe the
-/// well-known per-user install locations claude ships to. This matters on
-/// Windows: the native installer drops `claude.exe` in `%USERPROFILE%\.local\bin`
-/// and adds that directory to the **User** `PATH`, but a process launched from a
-/// terminal that started *before* the installer ran inherits the stale `PATH`
-/// without it. Without this fallback the app then reports "not found" even
-/// though claude is installed — the exact "works on Linux, not Windows" failure
-/// (on Linux `~/.local/bin` is already on `PATH` via the shell profile).
-///
-/// Returns `None` if nothing matches.
-#[cfg(windows)]
-fn resolve_windows_program(program: &str) -> Option<PathBuf> {
-    use std::path::Path;
-
-    let exts: Vec<String> = std::env::var("PATHEXT")
-        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned())
-        .split(';')
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    // Try `base` verbatim, then — only if it carries no extension — `base` with
-    // each PATHEXT suffix (so `claude.exe` is never mangled into `claude.exe.cmd`).
-    let try_with_exts = |base: &Path| -> Option<PathBuf> {
-        if base.is_file() {
-            return Some(base.to_path_buf());
-        }
-        if base.extension().is_none() {
-            let base_str = base.to_str()?;
-            for ext in &exts {
-                let cand = PathBuf::from(format!("{base_str}{ext}"));
-                if cand.is_file() {
-                    return Some(cand);
-                }
-            }
-        }
-        None
-    };
-
-    let p = Path::new(program);
-    if p.is_absolute() || program.contains(['\\', '/']) {
-        return try_with_exts(p);
-    }
-
-    // Search PATH first, then the known per-user install dirs a stale PATH may
-    // have missed. Ordering matters: an on-PATH hit always wins over a fallback.
-    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|v| std::env::split_paths(&v).collect())
-        .unwrap_or_default();
-    resolve_bare_in_dirs(
-        program,
-        &exts,
-        path_dirs.iter().chain(windows_fallback_dirs().iter()),
-    )
-}
-
-/// Search `dirs` (in order) for a bare `program`, honoring `exts` when the name
-/// carries no extension. Split out so the PATH-miss → fallback-hit behavior is
-/// testable without mutating process-global environment variables.
-#[cfg(windows)]
-fn resolve_bare_in_dirs<'a, I>(program: &str, exts: &[String], dirs: I) -> Option<PathBuf>
-where
-    I: IntoIterator<Item = &'a PathBuf>,
-{
-    use std::path::Path;
-    let try_with_exts = |base: &Path| -> Option<PathBuf> {
-        if base.is_file() {
-            return Some(base.to_path_buf());
-        }
-        if base.extension().is_none() {
-            let base_str = base.to_str()?;
-            for ext in exts {
-                let cand = PathBuf::from(format!("{base_str}{ext}"));
-                if cand.is_file() {
-                    return Some(cand);
-                }
-            }
-        }
-        None
-    };
-    dirs.into_iter()
-        .find_map(|dir| try_with_exts(&dir.join(program)))
-}
-
-/// Well-known per-user directories claude's Windows installers place shims in,
-/// probed only after a `PATH` search fails (see [`resolve_windows_program`]).
-#[cfg(windows)]
-fn windows_fallback_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    // Native installer → %USERPROFILE%\.local\bin\claude.exe
-    if let Some(profile) = std::env::var_os("USERPROFILE") {
-        dirs.push(PathBuf::from(&profile).join(".local").join("bin"));
-    }
-    // npm global → %APPDATA%\npm\claude.cmd
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        dirs.push(PathBuf::from(&appdata).join("npm"));
-    }
-    dirs
-}
-
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 
@@ -387,69 +333,6 @@ mod tests {
         let result = Session::spawn(&cfg);
         assert!(result.is_err(), "missing binary should fail");
         assert_eq!(result.err().unwrap().kind(), std::io::ErrorKind::NotFound);
-    }
-
-    // On Windows npm ships the CLI as `claude.cmd`, which a bare
-    // `Command::new("claude")` never finds. `resolve_windows_program` must pick
-    // it up by appending a PATHEXT suffix to an extensionless name. Uses an
-    // explicit path (no PATH mutation) to stay deterministic and race-free.
-    #[test]
-    #[cfg(windows)]
-    fn resolve_finds_cmd_shim_by_pathext() {
-        let dir = std::env::temp_dir().join(format!("lib-claude-resolve-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let shim = dir.join("claude.cmd");
-        std::fs::write(&shim, b"@echo off\r\n").unwrap();
-
-        // Ask for the extensionless path; resolution should append a PATHEXT
-        // suffix and land on the shim. The suffix's case follows PATHEXT (often
-        // uppercase `.CMD`), which the case-insensitive filesystem still opens,
-        // so compare case-insensitively rather than byte-for-byte.
-        let extless = dir.join("claude");
-        let got = resolve_windows_program(extless.to_str().unwrap()).expect("shim should resolve");
-        assert!(got.is_file(), "resolved path must exist");
-        assert_eq!(
-            got.to_string_lossy().to_lowercase(),
-            shim.to_string_lossy().to_lowercase()
-        );
-
-        // A name that resolves to nothing yields None.
-        assert!(resolve_windows_program(&dir.join("nope").to_string_lossy()).is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // A stale PATH (missing the install dir) must still resolve when the binary
-    // sits in a fallback dir — the real Windows failure mode where the native
-    // installer added %USERPROFILE%\.local\bin to PATH but the running process
-    // inherited the pre-install PATH. Exercises the dir-search seam directly so
-    // no process-global PATH/USERPROFILE mutation is needed.
-    #[test]
-    #[cfg(windows)]
-    fn resolve_bare_falls_back_to_known_dir() {
-        let dir = std::env::temp_dir().join(format!("lib-claude-fallback-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("claude.exe"), b"MZ").unwrap();
-
-        let exts: Vec<String> = [".COM", ".EXE", ".CMD"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-
-        // PATH-only dirs (no match) → None.
-        let empty: Vec<PathBuf> = vec![std::env::temp_dir()];
-        assert!(resolve_bare_in_dirs("claude", &exts, empty.iter()).is_none());
-
-        // PATH miss followed by the fallback dir → hit (order preserved).
-        let with_fallback: Vec<PathBuf> = vec![std::env::temp_dir(), dir.clone()];
-        let got = resolve_bare_in_dirs("claude", &exts, with_fallback.iter())
-            .expect("should resolve in fallback dir");
-        assert_eq!(
-            got.to_string_lossy().to_lowercase(),
-            dir.join("claude.exe").to_string_lossy().to_lowercase()
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -518,5 +401,23 @@ mod tests {
         }
         assert_eq!(drained, vec!["hello".to_owned()]);
         session.kill();
+    }
+
+    #[test]
+    fn the_command_line_carries_only_what_is_set() {
+        let mut cfg = SessionConfig::default();
+        let plain = args(&cfg);
+        assert!(plain.contains(&"--include-partial-messages".to_owned()));
+        assert!(!plain.contains(&"--model".to_owned()));
+        assert!(!plain.contains(&"--resume".to_owned()));
+        cfg.model = Some("opus".to_owned());
+        cfg.resume = Some("abc".to_owned());
+        cfg.include_partial = false;
+        cfg.extra_args = vec!["--x".to_owned()];
+        let a = args(&cfg);
+        assert!(a.windows(2).any(|w| w == ["--model", "opus"]));
+        assert!(a.windows(2).any(|w| w == ["--resume", "abc"]));
+        assert!(!a.contains(&"--include-partial-messages".to_owned()));
+        assert_eq!(a.last().map(String::as_str), Some("--x"));
     }
 }
