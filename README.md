@@ -1,4 +1,4 @@
-# claude_plugin_sicompass
+# claude-plugin-sicompass
 
 *Claude Code, in Sicompass.*
 
