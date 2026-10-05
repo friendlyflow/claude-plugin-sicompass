@@ -1,20 +1,23 @@
 //! Child-process management for a streaming `claude` session.
 //!
 //! **Plain pipes** rather than a PTY: `stream-json` wants a clean
-//! newline-delimited byte stream, not a terminal grid. Inside the sandbox the
-//! host runs the CLI (`process`, which `plugin.json` asks for) and its reads
-//! never block. Natively, for the unit tests, `std::process` with a reader
-//! thread that blocks on `BufReader::read_line`. Either way the plugin's
+//! newline-delimited byte stream, not a terminal grid. `std::process`, with a
+//! reader thread that blocks on `BufReader::read_line`, so the plugin's
 //! methods only ever do non-blocking drains.
 
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 /// How to spawn the `claude` child process.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
-    /// The `claude` program: in the sandbox the name `plugin.json` lists
-    /// (the host finds it on `PATH` or in `~/.local/bin`), natively a name or
-    /// a path.
+    /// The `claude` program: a name, found as [`crate::program::resolve`]
+    /// does (`PATH`, then `~/.local/bin`, then macOS's application bundles),
+    /// or a path.
     pub program: String,
     /// `--permission-mode` value: default | acceptEdits | plan | bypassPermissions.
     pub permission_mode: String,
@@ -73,115 +76,10 @@ fn args(cfg: &SessionConfig) -> Vec<String> {
     args
 }
 
-// ---------------------------------------------------------------------------
-// In the sandbox: the host's pipes
-// ---------------------------------------------------------------------------
-
-/// A running `claude --output-format stream-json`. Dropping it drops the
-/// host resource, which kills the program.
-#[cfg(target_arch = "wasm32")]
-pub struct Session {
-    child: sicompass_pdk::process::Child,
-    /// The unfinished line at the end of what has been read.
-    partial: std::cell::RefCell<Vec<u8>>,
-}
-
-#[cfg(target_arch = "wasm32")]
-impl Session {
-    pub fn spawn(cfg: &SessionConfig) -> std::io::Result<Session> {
-        let cwd = cfg.cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
-        let child = sicompass_pdk::process::Child::spawn(
-            &cfg.program,
-            &args(cfg),
-            cwd.as_deref(),
-            &[],
-            &[],
-            None,
-        )
-        .map_err(|e| {
-            // The host says why; a program it cannot find reads as NotFound,
-            // as a spawn outside the sandbox would.
-            let kind = if e.contains("not found") {
-                std::io::ErrorKind::NotFound
-            } else {
-                std::io::ErrorKind::Other
-            };
-            std::io::Error::new(kind, e)
-        })?;
-        Ok(Session {
-            child,
-            partial: std::cell::RefCell::new(Vec::new()),
-        })
-    }
-
-    /// Take all complete JSONL lines that arrived since the last call.
-    pub fn drain_lines(&self) -> Vec<String> {
-        let mut partial = self.partial.borrow_mut();
-        loop {
-            let chunk = self.child.read(1 << 20);
-            if chunk.is_empty() {
-                break;
-            }
-            partial.extend(chunk);
-        }
-        let Some(end) = partial.iter().rposition(|b| *b == b'\n') else {
-            return Vec::new();
-        };
-        let complete: Vec<u8> = partial.drain(..=end).collect();
-        String::from_utf8_lossy(&complete)
-            .lines()
-            .map(|l| l.trim_end_matches('\r'))
-            .filter(|l| !l.is_empty())
-            .map(str::to_owned)
-            .collect()
-    }
-
-    /// Take all stderr text that arrived so far.
-    pub fn take_stderr(&self) -> String {
-        let mut out = Vec::new();
-        loop {
-            let chunk = self.child.read_stderr(1 << 20);
-            if chunk.is_empty() {
-                break;
-            }
-            out.extend(chunk);
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    }
-
-    /// Write one JSONL user message to the child's stdin.
-    pub fn write_user(&mut self, json_line: &str) -> std::io::Result<()> {
-        let mut bytes = json_line.as_bytes().to_vec();
-        bytes.push(b'\n');
-        self.child.write(&bytes).map_err(std::io::Error::other)
-    }
-
-    /// `true` until the child has exited and its output has all arrived.
-    pub fn is_alive(&mut self) -> bool {
-        self.child.try_wait().is_none()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Natively, for the tests: std::process
-// ---------------------------------------------------------------------------
-
-#[cfg(not(target_arch = "wasm32"))]
-use std::io::{BufRead, BufReader, Write};
-#[cfg(not(target_arch = "wasm32"))]
-use std::process::{Child, ChildStdin, Command, Stdio};
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::{Arc, Mutex};
-#[cfg(not(target_arch = "wasm32"))]
-use std::thread;
-
 /// A spawned `claude --output-format stream-json` process.
 ///
 /// `drain_lines()` is non-blocking and returns whatever complete JSONL lines
 /// the background reader thread has buffered since the previous call.
-#[cfg(not(target_arch = "wasm32"))]
 pub struct Session {
     child: Child,
     stdin: ChildStdin,
@@ -190,11 +88,13 @@ pub struct Session {
     alive: Arc<AtomicBool>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl Session {
     /// Spawn `cfg.program` in streaming-JSON mode with piped stdio.
     pub fn spawn(cfg: &SessionConfig) -> std::io::Result<Session> {
-        let mut cmd = Command::new(&cfg.program);
+        // Not found anywhere: the bare name, which fails with `NotFound`.
+        let exe =
+            crate::program::resolve(&cfg.program).unwrap_or_else(|| PathBuf::from(&cfg.program));
+        let mut cmd = sicompass_sdk::plugin::command(exe);
         cmd.args(args(cfg));
         if let Some(cwd) = &cfg.cwd {
             cmd.current_dir(cwd);
@@ -298,9 +198,8 @@ impl Session {
         !matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
-    /// OS process id of the child. (Inside the sandbox the host reports it
-    /// to the tab switcher itself.)
-    #[cfg(test)]
+    /// OS process id of the child, which the app's tab switcher names the
+    /// tab after.
     pub fn pid(&self) -> Option<u32> {
         Some(self.child.id())
     }
@@ -313,14 +212,13 @@ impl Session {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl Drop for Session {
     fn drop(&mut self) {
         self.kill();
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -352,7 +250,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn write_then_drain_round_trips_a_line() {
-        let mut child = Command::new("cat")
+        let mut child = std::process::Command::new("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

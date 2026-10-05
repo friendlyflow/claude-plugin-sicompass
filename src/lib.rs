@@ -40,6 +40,7 @@ mod claude_home;
 mod events;
 mod fsx;
 mod localize;
+mod program;
 mod render;
 mod session;
 mod sessions;
@@ -50,7 +51,7 @@ use sessions::_set_test_projects_root;
 
 use std::path::{Path, PathBuf};
 
-use sicompass_pdk::{Descriptor, FfonElement, ListItem, Plugin, PollResult, export_plugin};
+use sicompass_sdk::plugin::{Descriptor, FfonElement, ListItem, Plugin, PollResult};
 
 use render::Conversation;
 use session::{Session, SessionConfig};
@@ -679,9 +680,8 @@ impl ClaudeProvider {
         localize::t("claude-display-name")
     }
 
-    /// OS process id of the child, if started (natively; inside the sandbox
-    /// the host reports it to the tab switcher itself).
-    #[cfg(test)]
+    /// OS process id of the child, if started. The app's tab switcher names
+    /// the tab after it.
     fn process_id(&self) -> Option<u32> {
         self.session.as_ref().and_then(|s| s.pid())
     }
@@ -809,6 +809,7 @@ impl Plugin for ClaudeProvider {
             at_root: self.at_root(),
             error: self.take_error(),
             announcement: self.take_announcement(),
+            child_pid: self.process_id(),
             ..Default::default()
         }
     }
@@ -819,9 +820,9 @@ impl Plugin for ClaudeProvider {
     fn init(&mut self) {
         self.view = View::Browse;
         self.browse_path = PathBuf::from("/");
-        // The settings `plugin.json` declares, from the host. (The unit tests
-        // set them through `on_setting_change`.)
-        #[cfg(target_arch = "wasm32")]
+        // The settings `plugin.json` declares, from the app. (Outside
+        // sicompass there are none, and the unit tests set them through
+        // `on_setting_change`.)
         for key in [
             SETTING_FOLDER,
             "claudePermissionMode",
@@ -829,7 +830,7 @@ impl Plugin for ClaudeProvider {
             "claudeExtraArgs",
             "claudeStreamPartial",
         ] {
-            if let Some(v) = sicompass_pdk::host::get_setting(key) {
+            if let Some(v) = sicompass_sdk::plugin::host::get_setting(key) {
                 self.on_setting_change(key, &v);
             }
         }
@@ -948,8 +949,8 @@ impl Plugin for ClaudeProvider {
     //
     // For this provider the app routes `:` straight to `handle_command`, rather
     // than opening the command palette, so these are normally invoked without
-    // the list ever being drawn. They are still implemented properly: the WASM
-    // plugin bridge and the tests reach the provider through the generic command
+    // the list ever being drawn. They are still implemented properly: the
+    // plugin channel and the tests reach the provider through the generic command
     // path, and `commands()` is what tells the app which of the two transitions
     // is currently available — that is how the app decides whether `:` should
     // enter or leave the session without querying view state.
@@ -1025,7 +1026,7 @@ impl Plugin for ClaudeProvider {
         }
         // Not on the hot path: the app owns the FFON and splices the selection
         // into the input slot itself, so the `:` palette never reaches here.
-        // Implemented so the generic command route — the WASM bridge, and any
+        // Implemented so the generic command route — the plugin channel, and any
         // test driving the provider through the SDK trait — is not a silent
         // no-op. `selection` is already the full insert text (`/name`), and
         // appending rather than replacing matches the app-side behaviour.
@@ -1064,15 +1065,10 @@ impl Plugin for ClaudeProvider {
 /// The setting (declared in `plugin.json`) naming Claude Code's own folder.
 const SETTING_FOLDER: &str = "claudeFolder";
 
-/// A diagnostic line in the host's log.
+/// A diagnostic line in the app's log for this plugin (stderr).
 fn log(msg: &str) {
-    #[cfg(target_arch = "wasm32")]
-    sicompass_pdk::host::log(msg);
-    #[cfg(not(target_arch = "wasm32"))]
-    let _ = msg;
+    sicompass_sdk::plugin::host::log(msg);
 }
-
-export_plugin!(ClaudeProvider);
 
 #[cfg(test)]
 mod tests {

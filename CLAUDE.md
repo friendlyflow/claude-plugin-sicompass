@@ -8,41 +8,49 @@ whose `/commit-and-push`, `/release`, `/sync` and `/update-cargo` take this
 repo's name as their first argument and then follow the skills in this repo's
 `.claude/skills/`.
 
-It is a sicompass **WASM plugin**: a `cdylib` built for `wasm32-wasip2` with
-`sicompass-pdk`, installed by the sicompass Store from this repo's GitHub
-releases. The plugin platform is described in
-`../sicompass/docs/plugin-platform.md` and `../sicompass/docs/wasm-plugins.md`.
+It is a sicompass **plugin process**: a program (`src/main.rs`) built with the
+SDK's `plugin` feature, which sicompass starts and talks to over its stdin and
+stdout. It runs with the user's rights. The Store installs it from this repo's
+GitHub releases, one build per platform. The plugin platform is described in
+`../sicompass/docs/plugin-platform.md`.
 
 - `plugin.json` is the manifest. Its `name` is `claude` (the app gives `:`
   and the live input slot special treatment by that name, so it must not
   change) and its `displayName` `claude` is the settings section. It asks for
-  `"filesystem": ["/"]` and `"process": ["claude"]`, which the user approves
-  at install.
+  `"filesystem": ["/"]` and `"process": ["claude"]`. They are what the plugin
+  declares it does, shown to the user before install.
 - `locales/<lang>.ftl`, every id prefixed `claude-`, in all four
   languages.
 
-## The sandbox, and what it changes
+## How it runs
 
-- **The CLI** runs on the host's pipes (`src/session.rs`), `std::process`
-  natively. The host finds `claude` on `PATH` or in `~/.local/bin` (and tries
-  `PATHEXT` on Windows), so there is no `claudeBinary` setting.
+- **The CLI** is a child process on plain pipes (`src/session.rs`), started
+  with `sicompass_sdk::plugin::command` (no console window on Windows), read
+  by threads so no call from the app waits on it. Its pid goes to the app in
+  `PollResult::child_pid`, which the tab switcher names the tab after.
+  `src/program.rs` finds `claude` on `PATH`, then in `~/.local/bin`, then on
+  macOS in `/Applications` and `~/Applications` (`<name>.app/Contents/MacOS`),
+  trying `PATHEXT` on Windows, so there is no `claudeBinary` setting.
 - **Claude Code's folder** (`~/.claude`: transcripts under `projects/`,
   personal and plugin skills) is the `claudeFolder` setting, whose `~` the
-  host expands. `src/claude_home.rs` holds it. Until it is set nothing there
+  app expands. `src/claude_home.rs` holds it. Until it is set nothing there
   is read, which is what keeps a test harness off the developer's own
   transcripts (Ctrl+D in the session list *deletes* one).
 - **The built-in skills and slash commands** belong to the CLI, so they are
-  listed only when `claude` can be found (`process.which`), and the command
-  scan reads the bundle `which` names, through `desktop.read-link` for its
-  symlinks.
+  listed only when `claude` can be found, and the command scan reads the
+  bundle that `src/program.rs` finds, following its symlinks.
+- **Strings** come from the app (`host::translate`). The unit tests run
+  outside sicompass and read the English bundle instead (`src/localize.rs`).
+- stdout is the channel to the app. `println!` lands in stderr, the app's log.
 - The unit tests keep their seams (`_set_test_projects_root`, thread-local,
   and the `cfg(test)` defaults that switch ambient reads off).
 
 ## Environment (Nix)
 
 The toolchain comes from the flake dev shell in [flake.nix](flake.nix): Rust
-from rust-overlay with the `wasm32-wasip2` target (nixpkgs' rustc has no `std`
-for it), `wasm-tools` and `jq`. Nothing is installed system-wide.
+from rust-overlay with this computer's plugin target (static musl on Linux,
+which nixpkgs' rustc has no `std` for) and `jq`. Nothing is installed
+system-wide.
 
 - **Check once per session**, then stick with the answer: `command -v cargo`.
   - Non-empty: the shell is inside `nix develop`, so run `cargo ...` directly.
@@ -70,8 +78,8 @@ instead, or split into separate sentences.
 ## Testing
 
 - After implementing changes, always run the tests before finishing:
-  `cargo test` (natively), and `./scripts/release-plugin.sh --dry-run`, which
-  also builds the component and audits its imports.
+  `cargo test`, and `./scripts/release-plugin.sh --dry-run`, which also builds
+  this computer's release and verifies it the way the Store will.
 - When adding new code, write or update tests.
 - If tests fail, fix the code. Never leave a task with failing tests.
 
@@ -94,6 +102,10 @@ against the `PLUGIN_PUBLIC_KEY` variable, the key the sicompass store list
 names. The secret key file is `~/.config/sicompass/plugin-keys/claude.key`
 on the maintainer's machine. Never print, copy or commit it.
 
-The SDK and the pdk come from crates.io (the source is
-`../sicompass-plugin-sdk`). The commented-out `[patch]` in `Cargo.toml` is for
-working on them together, and stays commented on main.
+The SDK comes from crates.io (the source is `../sicompass-plugin-sdk`). The
+commented-out `[patch]` in `Cargo.toml` is for working on them together, and
+stays commented on main.
+
+A release has one archive per platform. The release workflow builds them on
+five runners (Linux x86_64 and arm64 as static musl, macOS arm64 and x86_64,
+Windows x86_64), then packs, signs and verifies them in one job.

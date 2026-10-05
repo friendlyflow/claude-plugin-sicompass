@@ -428,21 +428,10 @@ fn cli_exists(program: &str) -> bool {
     which_on_path(program).is_some()
 }
 
-/// Where the program would start from. In the sandbox the host answers
-/// (`process.which`), for the program `plugin.json` lists.
-#[cfg(target_arch = "wasm32")]
+/// Where the program would start from: the same search a session's spawn
+/// makes (see [`crate::program::resolve`]).
 fn which_on_path(program: &str) -> Option<std::path::PathBuf> {
-    sicompass_pdk::process::which(program)
-        .ok()
-        .map(std::path::PathBuf::from)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn which_on_path(program: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
+    crate::program::resolve(program)
 }
 
 /// Identifies one build of the CLI: where it is, how big, and when it changed.

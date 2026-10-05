@@ -14,7 +14,8 @@ Code's slash commands to insert.
 
 It drives the `claude` command line tool you already have, with the login that
 tool already has, so there is no key to paste here. Install Claude Code first.
-Sicompass finds `claude` on your `PATH` or in `~/.local/bin`.
+Sicompass finds `claude` on your `PATH` or in `~/.local/bin` (and on macOS
+also in your Applications folders).
 
 Claude asks for your whole disk, to pick a project and read Claude Code's own
 folder, and to run `claude`. The Store shows that before you install it, and
@@ -29,21 +30,20 @@ keeps it up to date.
 ## Building from source
 
 ```bash
-nix develop          # the toolchain, with the wasm32-wasip2 target
-cargo test           # natively
-cargo build --release --target wasm32-wasip2
-cp target/wasm32-wasip2/release/claude_plugin.wasm plugin.wasm
+nix develop          # the toolchain
+cargo test
+cargo build --release
+cp target/release/claude-plugin plugin
 ```
 
-`./scripts/release-plugin.sh --dry-run` does the build, checks the component
-against `plugin.json`, and signs and verifies it with a throwaway key, the way
-a release is made.
+`./scripts/release-plugin.sh --dry-run` builds this computer's release, packs
+it, and signs and verifies it with a throwaway key, the way a release is made.
 
 ## Related repositories
 
 - [sicompass](https://github.com/friendlyflow/sicompass), the application
 - [sicompass-plugin-sdk](https://github.com/friendlyflow/sicompass-plugin-sdk),
-  the SDK, the WASM plugin kit and the cloud backup library
+  the SDK, the plugin kit and the cloud backup library
 
 ## Community
 
