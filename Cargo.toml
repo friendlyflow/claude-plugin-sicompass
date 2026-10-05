@@ -3,7 +3,7 @@
 
 [package]
 name = "claude-plugin"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Claude Code for sicompass: a session's stream-JSON as a list, as a plugin"
