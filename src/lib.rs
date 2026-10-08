@@ -89,13 +89,14 @@ pub const CMD_DELETE_SESSION: &str = "delete session";
 
 /// Command id: press the `<button>` row the cursor is on. Carries the row's key.
 ///
-/// Exists because `on_button_press` returns `()` and so cannot hand the app a
-/// row to insert, which the `new session` button has to do. Routing every
-/// session-list button through one command keeps the button vocabulary
-/// (`BTN_*`) entirely inside this crate.
+/// Exists so every session-list button goes through one command, which keeps
+/// the button vocabulary (`BTN_*`) entirely inside this crate. None of them
+/// hands back a row: `new session` swaps to an empty session, and the two
+/// confirmation buttons answer the pending deletion.
 pub const CMD_ACTIVATE_ROW: &str = "activate row";
 
-/// Button id: start a session, typing its first prompt into the row this opens.
+/// Button id: open an empty session, whose first prompt is typed on its own
+/// prompt row like any other session's.
 const BTN_NEW_SESSION: &str = "new-session";
 /// Button id: confirm the pending deletion.
 const BTN_CONFIRM_DELETE: &str = "confirm-delete-yes";
@@ -400,13 +401,22 @@ impl ClaudeProvider {
         true
     }
 
-    /// Start a brand-new session in `browse_path`, dropping whatever was open.
+    /// Open a brand-new session in `browse_path`, dropping whatever was open,
+    /// without spawning anything.
+    ///
+    /// What the `new session` button does. The same bargain [`Self::open_session`]
+    /// strikes: a session the user opens and walks away from costs no process.
+    /// The first prompt spawns it, through `commit_edit` and `send_prompt`.
     ///
     /// [`Self::enter_session`]'s same-folder reuse is deliberately absent: the
     /// user asked for a *new* session, so an existing child in the same folder
     /// is not something to rejoin. `last_session_id` is cleared for the same
     /// reason — a new session must not be spawned with `--resume`.
-    fn start_new_session(&mut self) {
+    ///
+    /// The first prompt is typed on the session's own trailing prompt row, not
+    /// on a row in the list, so a new session is the same place as any other:
+    /// Ctrl+: offers the skills there, and Left goes back to the list.
+    fn open_new_session(&mut self) {
         self.view = View::Session;
         self.session = None;
         self.convo = Conversation::default();
@@ -418,29 +428,27 @@ impl ClaudeProvider {
         self.session_path = self.browse_path.to_string_lossy().into_owned();
         self.init_attempted = false;
         self.spawn_error = None;
+    }
+
+    /// [`Self::open_new_session`] plus the spawn the first prompt would make,
+    /// for the tests that exercise a running session.
+    #[cfg(test)]
+    fn start_new_session(&mut self) {
+        self.open_new_session();
         self.ensure_session();
     }
 
     /// Enter on a `<button>` row of the session list.
     ///
-    /// Returns the row the app should insert and drop into Insert mode on —
-    /// only `new session` has one. The button vocabulary never leaves this
+    /// Never returns a row: every button here changes the view instead, and the
+    /// app reads `None` as "refresh". The button vocabulary never leaves this
     /// crate: the app forwards the row key and learns nothing about it.
     fn activate_row(&mut self, element_key: &str) -> Option<FfonElement> {
         let name = sicompass_sdk::tags::extract_button_function_name(element_key)?;
         match name.as_str() {
             BTN_NEW_SESSION => {
-                // A label prefix, not a bare `<input></input>`: an empty input
-                // with no prefix takes the app's create-file commit path, whose
-                // fallback calls `handle_escape` and strips the row right after
-                // a *successful* commit. It also gives the row something to say.
-                // The space lives here rather than in the bundles: Fluent trims
-                // trailing whitespace off a value, so a translator cannot put
-                // one there even if they wanted to.
-                Some(FfonElement::new_str(format!(
-                    "{} <input></input>",
-                    localize::t("claude-prompt-label")
-                )))
+                self.open_new_session();
+                None
             }
             BTN_CANCEL_DELETE => {
                 self.pending_delete = None;
@@ -900,31 +908,9 @@ impl Plugin for ClaudeProvider {
     }
 
     fn commit_edit(&mut self, old: &str, new: &str) -> bool {
-        // The session list's first-prompt row, which the `new session` button
-        // opened. Ahead of both rejections below, and on purpose: the view is
-        // `Sessions` rather than `Session`, and a re-edit of the row arrives
-        // with a non-empty `old`. It is the only editable row that level has,
-        // so no further test is needed to recognise it.
-        if self.view == View::Sessions {
-            let prompt = new.trim().to_owned();
-            if prompt.is_empty() {
-                // Refusing leaves the cursor in the row to try again, rather
-                // than starting a session with nothing to say.
-                return false;
-            }
-            self.start_new_session();
-            if !self.send_prompt(&prompt) {
-                // The child did not start. The swap still happened and
-                // `spawn_error` is already on screen above the slot, so report
-                // success: landing in the session with the reason showing beats
-                // leaving the user in a list with an unexplained refusal. The
-                // prompt goes back into the slot rather than being thrown away.
-                self.pending_input = prompt;
-            }
-            return true;
-        }
-        // Browsing is read-only: reject the `i` placeholder the app seeds into
-        // an empty directory rather than turning it into a file-creation path.
+        // Browsing and the session list are read-only: reject the `i`
+        // placeholder the app seeds into an empty directory rather than turning
+        // it into a file-creation path.
         if self.view != View::Session {
             return false;
         }
@@ -1833,52 +1819,66 @@ mod tests {
     }
 
     #[test]
-    fn the_new_session_button_opens_a_labelled_input_row() {
-        // A bare `<input></input>` would take the app's create-file commit path,
-        // whose fallback strips the row right after a successful commit. The
-        // prefix is what keeps it on the ordinary path, and what gives the row
-        // something to say.
-        let mut p = ClaudeProvider::new();
-        p.view = View::Sessions;
-        let mut err = String::new();
-        let key = format!("<button>{BTN_NEW_SESSION}</button>new session");
-        let row = p
-            .handle_command(CMD_ACTIVATE_ROW, &key, 0, &mut err)
-            .expect("the button hands back a row to type into");
-        let text = row_key(&[row], 0);
-        assert!(sicompass_sdk::tags::has_input(&text));
-        assert!(
-            !text.starts_with("<input>"),
-            "the row needs a label before the input, got {text:?}"
-        );
-    }
-
-    #[test]
-    fn committing_the_first_prompt_starts_a_fresh_session() {
+    fn the_new_session_button_opens_an_empty_session_without_spawning() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let mut p = browsing(&root);
-        p.program = "definitely-not-claude-xyz-9000".to_owned();
         p.last_session_id = Some("some-old-session".to_owned());
+        p.convo.push_user("a past conversation");
         p.enter_sessions();
 
-        assert!(!p.commit_edit("", "  "), "a blank prompt is refused");
-        assert_eq!(p.view, View::Sessions, "and leaves the cursor in the row");
+        let mut err = String::new();
+        let key = format!("<button>{BTN_NEW_SESSION}</button>new session");
+        let row = p.handle_command(CMD_ACTIVATE_ROW, &key, 0, &mut err);
 
-        // The spawn fails (the binary cannot exist). The swap still reports
-        // success, so the user lands in the session with the reason on screen
-        // rather than being refused in the list with no explanation.
-        assert!(p.commit_edit("", "what does this crate do?"));
+        assert!(row.is_none(), "a view swap, not a row to insert");
+        assert!(err.is_empty());
         assert_eq!(p.view, View::Session);
-        assert!(p.spawn_error.is_some(), "and the reason is on screen");
-        assert_eq!(
-            p.pending_input, "what does this crate do?",
-            "the prompt goes back in the slot rather than being thrown away"
-        );
+        assert!(p.convo.turns.is_empty(), "nothing of the old conversation");
         assert!(
             p.last_session_id.is_none(),
             "a new session must not be spawned with --resume"
         );
+        assert!(
+            p.process_id().is_none() && p.spawn_error.is_none(),
+            "no process until the first prompt"
+        );
+        assert_eq!(p.current_path(), root.to_str().unwrap());
+        assert!(
+            p.commands().iter().any(|c| c == CMD_SKILLS),
+            "the skills are on offer while the first prompt is typed"
+        );
+        let out = p.fetch();
+        assert!(
+            sicompass_sdk::tags::has_input(&row_key(&out, out.len() - 1)),
+            "the level ends in the prompt row: {:?}",
+            names(&out)
+        );
+    }
+
+    #[test]
+    fn the_first_prompt_of_a_new_session_spawns_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut p = browsing(&root);
+        p.enter_sessions();
+        let mut err = String::new();
+        let key = format!("<button>{BTN_NEW_SESSION}</button>new session");
+        p.handle_command(CMD_ACTIVATE_ROW, &key, 0, &mut err);
+
+        // The spawn fails (the binary cannot exist): the prompt is refused and
+        // the reason is on screen above the slot, as in any other session.
+        assert!(!p.commit_edit("", "what does this crate do?"));
+        assert_eq!(p.view, View::Session);
+        assert!(p.spawn_error.is_some(), "the first prompt tried to spawn");
+    }
+
+    #[test]
+    fn the_session_list_has_nothing_to_commit() {
+        let mut p = ClaudeProvider::new();
+        p.view = View::Sessions;
+        assert!(!p.commit_edit("", "what does this crate do?"));
+        assert_eq!(p.view, View::Sessions);
     }
 
     #[test]
