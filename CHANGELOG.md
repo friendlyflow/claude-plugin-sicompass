@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1
+
+- The new session button opens an empty session. You type the first prompt on
+  the session's own prompt row, where Ctrl+: lists the skills, and Claude starts
+  when you send it.
+
 ## 0.3.0
 
 Claude is a program of its own now, instead of a sandboxed WebAssembly component.
