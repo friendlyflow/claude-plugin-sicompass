@@ -257,12 +257,44 @@ fn push_capped_lines(obj: &mut sicompass_sdk::FfonObject, text: &str) {
 /// the tag syntax's own escape and `strip_display` unescapes it, so the text
 /// still reads back exactly as it was written.
 ///
+/// `plugin.json` also asks for markup, so `<b>` or a `<style>` row in an answer
+/// would change how the list looks. The same escape covers those.
+///
 /// Applies to everything the model, the shell or the user produced — prose,
-/// tool input, tool output, the prompt echo, the session's own metadata. The
-/// live input slot is deliberately *not* escaped: its `<input>` is real markup
-/// the app parses back out with `extract_input`.
+/// tool input, tool output, the prompt echo, the session's own metadata, and the
+/// value inside the live input slot. The slot's own `<input>` tag stays: it is
+/// real markup the app parses back out with `extract_input`.
 pub(crate) fn escape_markup(s: &str) -> String {
-    s.replace('<', "\\<").replace('>', "\\>")
+    sicompass_sdk::tags::escape(s)
+}
+
+/// Undo [`escape_markup`]. Text with no `\<` or `\>` passes through untouched, so
+/// a lone backslash survives. Only for a value known to come out of a row
+/// (`extract_id`, `extract_input`): typed text is already plain.
+pub(crate) fn unescape_markup(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(bracket) = chars.next_if(|next| matches!(next, '<' | '>'))
+        {
+            out.push(bracket);
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Whether `value`, handed over by the app for the live input slot, is only that
+/// slot's own text `plain` as the row holds it, rather than something new. The app
+/// answers Enter on a filled slot, and a cancelled edit, with the row's raw
+/// `<input>`, not with typed text.
+pub(crate) fn slot_reads_back_as(value: &str, plain: &str) -> bool {
+    value == plain || value == escape_markup(plain)
 }
 
 /// Split an assistant message into the lines its label shows.
@@ -371,12 +403,13 @@ pub fn build(convo: &Conversation, pending_input: &str) -> Vec<FfonElement> {
             escape_markup(mode),
             convo.tools_count
         );
+        // `body_element` escapes each line of the detail.
         let mut detail = String::new();
         if let Some(cwd) = &convo.cwd {
-            detail.push_str(&format!("cwd: {}\n", escape_markup(cwd)));
+            detail.push_str(&format!("cwd: {cwd}\n"));
         }
         if let Some(sid) = &convo.session_id {
-            detail.push_str(&format!("session id: {}\n", escape_markup(sid)));
+            detail.push_str(&format!("session id: {sid}\n"));
         }
         // `body_element` keeps it a `Str` when there is no detail to expand.
         out.push(body_element(key, Some(detail.trim_end_matches('\n'))));
@@ -448,7 +481,7 @@ pub fn build(convo: &Conversation, pending_input: &str) -> Vec<FfonElement> {
                 }
                 let suffix = if *is_error { "  [error]" } else { "" };
                 out.push(body_element(
-                    format!("tool result: {tool_name}{suffix}"),
+                    format!("tool result: {}{suffix}", escape_markup(tool_name)),
                     Some(summary.as_str()),
                 ));
             }
@@ -508,7 +541,8 @@ pub fn build(convo: &Conversation, pending_input: &str) -> Vec<FfonElement> {
     // label, the way the terminal's `user@host:~$ ` prompt does, rather than
     // running straight on from the last word.
     out.push(FfonElement::new_str(format!(
-        "send to claude: <input>{pending_input}</input>"
+        "send to claude: <input>{}</input>",
+        escape_markup(pending_input)
     )));
 
     out

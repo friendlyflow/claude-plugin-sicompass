@@ -329,7 +329,7 @@ impl ClaudeProvider {
         names.sort_by(|a, b| natord::compare_ignore_case(a, b));
         names
             .into_iter()
-            .map(|n| FfonElement::new_obj(&n))
+            .map(|n| FfonElement::new_obj(render::escape_markup(&n)))
             .collect()
     }
 
@@ -568,7 +568,7 @@ impl ClaudeProvider {
             // than by a label two sessions could share.
             out.push(FfonElement::new_obj(format!(
                 "{}{}",
-                sicompass_sdk::tags::format_id(&meta.id),
+                sicompass_sdk::tags::format_id(&render::escape_markup(&meta.id)),
                 render::escape_markup(&label)
             )));
         }
@@ -621,7 +621,7 @@ impl ClaudeProvider {
         let mut out = render::build(&self.convo, &self.pending_input);
         if let Some(msg) = &self.spawn_error {
             let at = out.len().saturating_sub(1);
-            out.insert(at, FfonElement::new_str(msg.clone()));
+            out.insert(at, FfonElement::new_str(render::escape_markup(msg)));
         }
         out
     }
@@ -742,12 +742,13 @@ impl ClaudeProvider {
                 // stale key) leaves the view alone rather than opening the
                 // wrong transcript.
                 if let Some(id) = sicompass_sdk::tags::extract_id(element_key) {
-                    self.open_session(&id);
+                    self.open_session(&render::unescape_markup(&id));
                 }
             }
             CMD_SESSIONS => self.enter_sessions(),
             CMD_DELETE_SESSION => {
                 if let Some(id) = sicompass_sdk::tags::extract_id(element_key) {
+                    let id = render::unescape_markup(&id);
                     // Only arms the confirmation. The transcript is still there.
                     // The stand-in row for a just-started session has no file
                     // behind it yet, so there is nothing to offer to delete.
@@ -920,15 +921,26 @@ impl Plugin for ClaudeProvider {
         if !old.is_empty() {
             return false;
         }
-        let prompt = new.trim().to_owned();
+        // Typed text is plain and goes out as typed. Enter on a filled slot is the
+        // row's raw `<input>`, and means the plain text behind it.
+        let sent = if render::slot_reads_back_as(new, &self.pending_input) {
+            self.pending_input.as_str()
+        } else {
+            new
+        };
+        let prompt = sent.trim().to_owned();
         if prompt.is_empty() {
             return false;
         }
         self.send_prompt(&prompt)
     }
 
+    /// A restored `<input>` arrives raw and text from the insert palette plain.
+    /// `pending_input` is always plain, which `render::build` escapes again.
     fn set_input_value(&mut self, value: &str) {
-        self.pending_input = value.to_owned();
+        if !render::slot_reads_back_as(value, &self.pending_input) {
+            self.pending_input = render::unescape_markup(value);
+        }
     }
 
     // ---- Commands --------------------------------------------------------
@@ -2059,5 +2071,433 @@ mod tutorial_text_tests {
         for (locale, ftl) in &LOCALES[1..] {
             assert_eq!(tutorial_ids(ftl), en, "{locale} has drifted from en-US");
         }
+    }
+}
+
+/// `plugin.json` asks for markup, so everything here that the plugin did not write
+/// is escaped on its way into a row. The text below is what that is for.
+#[cfg(test)]
+mod markup_tests {
+    use super::*;
+    use crate::events::parse_lines;
+    use crate::render::{Conversation, Turn, build, escape_markup, unescape_markup};
+    use sicompass_sdk::{markup, tags};
+
+    const BOLD: &str = "<b>x</b>";
+    const STYLE: &str = "<style>li { color: red }</style>";
+    const INPUT: &str = "<input>y</input>";
+    const BACKSLASH: &str = r"ends in a backslash\";
+    const HOSTILE: [&str; 4] = [BOLD, STYLE, INPUT, BACKSLASH];
+
+    /// What the row reads, with nothing in it the app would act on.
+    fn assert_literal(row: &str, original: &str) {
+        assert!(!markup::has_markup(row), "markup in {row:?}");
+        assert_eq!(markup::style_sheet(row), None, "a stylesheet: {row:?}");
+        assert!(!tags::has_input(row), "an input in {row:?}");
+        assert!(!tags::has_button(row), "a button in {row:?}");
+        assert_eq!(tags::strip_display(row), original);
+    }
+
+    fn key_of(e: &FfonElement) -> &str {
+        e.as_str().unwrap_or_else(|| &e.as_obj().unwrap().key)
+    }
+
+    fn convo_from(lines: &[String]) -> Conversation {
+        let mut c = Conversation::default();
+        for ev in parse_lines(lines.iter().map(String::as_str)) {
+            c.apply(ev);
+        }
+        c
+    }
+
+    fn json(s: &str) -> String {
+        serde_json::to_string(s).unwrap()
+    }
+
+    fn reply(text: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":{}}}]}}}}"#,
+            json(text)
+        )
+    }
+
+    fn tool_call(id: &str, name: &str, input: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","id":{},"name":{},"input":{{"text":{}}}}}]}}}}"#,
+            json(id),
+            json(name),
+            json(input)
+        )
+    }
+
+    fn tool_result(id: &str, output: &str) -> String {
+        format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":{},"content":{},"is_error":false}}]}}}}"#,
+            json(id),
+            json(output)
+        )
+    }
+
+    /// Unescaped, the app would act on these, which is what the tests below rule out.
+    #[test]
+    fn this_text_is_live_when_nothing_escapes_it() {
+        assert!(markup::has_markup(BOLD));
+        assert!(markup::style_sheet(STYLE).is_some());
+        assert!(tags::has_input(INPUT));
+    }
+
+    #[test]
+    fn the_manifest_asks_for_markup() {
+        assert!(include_str!("../plugin.json").contains(r#""markup": true"#));
+    }
+
+    #[test]
+    fn a_reply_is_shown_literally() {
+        for text in HOSTILE {
+            let c = convo_from(&[reply(text)]);
+            let out = build(&c, "");
+            assert_literal(key_of(&out[0]), &format!("claude: {text}"));
+        }
+    }
+
+    #[test]
+    fn a_reply_in_a_fenced_block_is_shown_literally() {
+        let c = convo_from(&[reply(&format!("```html\n{}\n```", HOSTILE.join("\n")))]);
+        let out = build(&c, "");
+        assert_literal(
+            key_of(&out[0]),
+            &format!("claude: ```html\n{}\n```", HOSTILE.join("\n")),
+        );
+    }
+
+    #[test]
+    fn a_reply_still_streaming_is_shown_literally() {
+        let mut c = Conversation::default();
+        c.partial.active = true;
+        c.partial.text = HOSTILE.join("\n");
+        c.partial.tools.push(BOLD.to_owned());
+        let out = build(&c, "");
+        let obj = out[0].as_obj().unwrap();
+        for (row, original) in obj.children.iter().zip(HOSTILE) {
+            assert_literal(key_of(row), original);
+        }
+        assert_literal(
+            key_of(&obj.children[HOSTILE.len()]),
+            "tool: <b>x</b> (preparing…)",
+        );
+    }
+
+    #[test]
+    fn a_prompt_echo_is_shown_literally() {
+        for text in HOSTILE {
+            let mut c = Conversation::default();
+            c.push_user(&format!("first line\n{text}"));
+            let out = build(&c, "");
+            assert_literal(key_of(&out[0]), "you: first line");
+            assert_literal(key_of(&out[1]), text);
+
+            let mut c = Conversation::default();
+            c.push_user(text);
+            let out = build(&c, "");
+            assert_literal(key_of(&out[0]), &format!("you: {text}"));
+        }
+    }
+
+    #[test]
+    fn a_tool_call_and_its_output_are_shown_literally() {
+        for text in HOSTILE {
+            let c = convo_from(&[tool_call("t1", "Bash", text), tool_result("t1", text)]);
+            let out = build(&c, "");
+            let obj = out[0].as_obj().unwrap();
+            assert_literal(
+                &obj.key,
+                &format!(r#"claude: Bash: {{"text":{}}}"#, json(text)),
+            );
+            assert_literal(key_of(&obj.children[0]), text);
+        }
+    }
+
+    /// Its name is whatever the id was, for a call not in the log.
+    #[test]
+    fn a_result_with_no_call_is_shown_literally() {
+        for text in [BOLD, STYLE, INPUT] {
+            let c = convo_from(&[tool_result(text, BOLD)]);
+            let out = build(&c, "");
+            let obj = out[0].as_obj().unwrap();
+            assert_literal(&obj.key, &format!("tool result: {text}"));
+            assert_literal(key_of(&obj.children[0]), BOLD);
+        }
+    }
+
+    /// Was escaped twice, once for the detail and again for each of its lines, so a
+    /// folder holding a bracket read back with a backslash in it.
+    #[test]
+    fn the_session_header_is_shown_literally() {
+        let c = Conversation {
+            model: Some(BOLD.to_owned()),
+            permission_mode: Some(STYLE.to_owned()),
+            cwd: Some(format!("/home/{INPUT}")),
+            session_id: Some(format!("id{BOLD}")),
+            ..Default::default()
+        };
+        let out = build(&c, "");
+        let obj = out[0].as_obj().unwrap();
+        assert_literal(&obj.key, &format!("session: {BOLD}  ({STYLE}, 0 tools)"));
+        assert_literal(key_of(&obj.children[0]), &format!("cwd: /home/{INPUT}"));
+        assert_literal(key_of(&obj.children[1]), &format!("session id: id{BOLD}"));
+    }
+
+    #[test]
+    fn a_failure_to_start_is_shown_literally() {
+        let mut p = ClaudeProvider::new();
+        p.view = View::Session;
+        p.spawn_error = Some(format!("could not start {BOLD} in {INPUT}"));
+        let out = p.fetch();
+        assert_literal(
+            key_of(&out[out.len() - 2]),
+            &format!("could not start {BOLD} in {INPUT}"),
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_folder_is_listed_literally_and_entered_by_its_real_name() {
+        for name in [
+            "<b>x",
+            "<style>li { color: red }",
+            "<input>y",
+            r"\<b>",
+            r"mid\dle",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let real = dir.path().join(name);
+            std::fs::create_dir(&real).unwrap();
+
+            let mut p = ClaudeProvider::new();
+            p.browse_path = dir.path().to_path_buf();
+            let out = p.fetch();
+            let key = key_of(&out[0]).to_owned();
+            assert_literal(&key, name);
+            p.push_path(&tags::strip_display(&key));
+            assert_eq!(p.browse_path, real);
+        }
+    }
+
+    /// Listed right, entered wrong, with or without markup: `push_path` trims a
+    /// trailing backslash on every platform, so on Unix a folder really named `back\`
+    /// is walked into as `back`. Trimming only on Windows would fix it.
+    #[test]
+    #[cfg(unix)]
+    fn known_limit_a_folder_ending_in_a_backslash_loses_it_on_the_way_in() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(BACKSLASH)).unwrap();
+        let mut p = ClaudeProvider::new();
+        p.browse_path = dir.path().to_path_buf();
+        let out = p.fetch();
+        let segment = tags::strip_display(key_of(&out[0]));
+        assert_eq!(segment, BACKSLASH);
+        p.push_path(&segment);
+        assert_eq!(
+            p.browse_path,
+            dir.path().join(BACKSLASH.trim_end_matches('\\'))
+        );
+    }
+
+    /// A session list over one transcript, whose title and id the transcript chose.
+    fn sessions_list(
+        id: &str,
+        title: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir, ClaudeProvider) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let projects = tempfile::tempdir().unwrap();
+        let folder = projects
+            .path()
+            .join("projects")
+            .join(sessions::dashify(&root));
+        std::fs::create_dir_all(&folder).unwrap();
+        let body = format!(
+            concat!(
+                r#"{{"type":"user","cwd":{},"message":{{"role":"user","content":"first prompt"}}}}"#,
+                "\n",
+                r#"{{"type":"ai-title","aiTitle":{},"sessionId":{}}}"#,
+                "\n"
+            ),
+            json(&root.to_string_lossy()),
+            json(title),
+            json(id),
+        );
+        std::fs::write(folder.join(format!("{id}.jsonl")), body).unwrap();
+        _set_test_projects_root(Some(projects.path().join("projects")));
+        let mut p = ClaudeProvider::new();
+        p.browse_path = root;
+        p.enter_sessions();
+        (dir, projects, p)
+    }
+
+    #[test]
+    fn a_session_title_is_shown_literally() {
+        for title in [BOLD, STYLE, BACKSLASH] {
+            let (_dir, _projects, mut p) = sessions_list("s1", title);
+            let out = p.fetch();
+            let row = key_of(&out[1]);
+            assert!(!markup::has_markup(row), "{row:?}");
+            assert!(!tags::has_input(row), "{row:?}");
+            assert_eq!(tags::strip_display(row), title);
+        }
+        _set_test_projects_root(None);
+    }
+
+    /// It reads as the title it is, and stays inert.
+    #[test]
+    fn a_session_title_holding_an_input_tag_displays_with_it() {
+        let (_dir, _projects, mut p) = sessions_list("s1", INPUT);
+        let out = p.fetch();
+        let row = key_of(&out[1]);
+        assert!(!markup::has_markup(row), "{row:?}");
+        assert!(!tags::has_input(row), "{row:?}");
+        assert_eq!(tags::strip_display(row), INPUT);
+        _set_test_projects_root(None);
+    }
+
+    /// The id rides in the row and comes back raw. The transcript's file names it, so
+    /// it can hold anything a file name can.
+    #[test]
+    fn a_session_id_comes_back_from_its_row_as_it_was() {
+        let (_dir, _projects, mut p) = sessions_list("<b>id", "a title");
+        let out = p.fetch();
+        let row = key_of(&out[1]).to_owned();
+        assert!(!markup::has_markup(&row), "{row:?}");
+        assert_eq!(tags::strip_display(&row), "a title");
+
+        let mut error = String::new();
+        ClaudeProvider::handle_command(&mut p, CMD_DELETE_SESSION, &row, 0, &mut error);
+        assert_eq!(p.pending_delete.as_deref(), Some("<b>id"));
+        p.pending_delete = None;
+
+        ClaudeProvider::handle_command(&mut p, CMD_SESSION, &row, 0, &mut error);
+        assert_eq!(p.convo.session_id.as_deref(), Some("<b>id"));
+        _set_test_projects_root(None);
+    }
+
+    #[test]
+    fn a_prefilled_slot_reads_back_as_what_was_prefilled() {
+        for value in [BOLD, STYLE, INPUT] {
+            let out = build(&Conversation::default(), value);
+            let slot = key_of(out.last().unwrap());
+            assert!(!markup::has_markup(slot), "{slot:?}");
+            assert!(tags::has_input(slot), "{slot:?}");
+            let raw = tags::extract_input(slot).unwrap();
+            assert_eq!(unescape_markup(&raw), value);
+        }
+    }
+
+    #[test]
+    fn a_slot_holding_a_trailing_backslash_is_an_input() {
+        let out = build(&Conversation::default(), BACKSLASH);
+        let slot = key_of(out.last().unwrap());
+        assert!(!markup::has_markup(slot), "{slot:?}");
+        assert!(tags::has_input(slot), "{slot:?}");
+        assert_eq!(tags::extract_input(slot).as_deref(), Some(BACKSLASH));
+    }
+
+    #[test]
+    fn set_input_value_keeps_the_slot_plain() {
+        for value in [BOLD, STYLE, INPUT, BACKSLASH, "a < b > c"] {
+            let mut p = ClaudeProvider::new();
+            p.set_input_value(&escape_markup(value));
+            assert_eq!(p.pending_input, value);
+            // The same raw value again, as a cancelled edit hands it back.
+            p.set_input_value(&escape_markup(value));
+            assert_eq!(p.pending_input, value);
+            p.set_input_value(value);
+            assert_eq!(p.pending_input, value);
+        }
+    }
+
+    /// A stand-in for `claude` that writes what it is sent to a file.
+    #[cfg(unix)]
+    fn recording_child(dir: &std::path::Path) -> (ClaudeProvider, std::path::PathBuf) {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let sent = dir.join("sent");
+        let stub = dir.join("fake-claude");
+        let mut f = std::fs::File::create(&stub).unwrap();
+        writeln!(f, "#!/bin/sh").unwrap();
+        writeln!(f, "exec cat > '{}'", sent.display()).unwrap();
+        drop(f);
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The same ETXTBSY retry as the other stub above.
+        for _ in 0..25 {
+            let mut p = ClaudeProvider::new();
+            p.program = stub.to_string_lossy().into_owned();
+            p.set_current_path(dir.to_str().unwrap());
+            p.start_new_session();
+            if p.session.is_some() {
+                return (p, sent);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("the stub would not start");
+    }
+
+    fn texts_sent(file: &std::path::Path, count: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let content = std::fs::read_to_string(file).unwrap_or_default();
+            let lines: Vec<&str> = content.lines().collect();
+            if lines.len() >= count || std::time::Instant::now() > deadline {
+                return lines
+                    .iter()
+                    .map(|l| {
+                        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                        v["message"]["content"][0]["text"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned()
+                    })
+                    .collect();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// What the model receives: the prompt's own bytes, however it got to `commit_edit`.
+    #[test]
+    #[cfg(unix)]
+    fn a_prompt_is_sent_with_its_original_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut p, sent) = recording_child(&root);
+
+        let mut expected = Vec::new();
+        for text in HOSTILE {
+            // Typed.
+            assert!(p.commit_edit("", text));
+            expected.push(text.to_owned());
+            // Enter on the slot once it is filled: the row's raw `<input>`.
+            p.set_input_value(text);
+            assert!(p.commit_edit("", &escape_markup(text)));
+            expected.push(text.to_owned());
+            assert!(p.pending_input.is_empty());
+        }
+        // Typed with escapes in it: those are the user's own, and stay.
+        assert!(p.commit_edit("", r"what does \<b\> do?"));
+        expected.push(r"what does \<b\> do?".to_owned());
+
+        assert_eq!(texts_sent(&sent, expected.len()), expected);
+        assert_eq!(p.history, expected);
+        let users: Vec<&str> = p
+            .convo
+            .turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::User { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, expected);
     }
 }
