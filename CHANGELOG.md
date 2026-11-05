@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2
+
+- Tool results, folders and session ids are shown exactly as written, never read as markup, and a prompt is sent with its own bytes.
+- Needs sicompass 0.2.4.
+- Intel macs are not built any more.
+
 ## 0.3.1
 
 - The new session button opens an empty session. You type the first prompt on
