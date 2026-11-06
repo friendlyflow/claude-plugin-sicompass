@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.3
+
+- The session list and the skills list appear at once. They used to be read again every time the plugin started, which took several seconds after an update: the transcripts for the session list, and the whole Claude Code program for its slash commands. The plugin now keeps what it read in its own folder, and reads the commands in the background when a tab opens.
+- Needs sicompass 0.2.4.
+
 ## 0.3.2
 
 - Tool results, folders and session ids are shown exactly as written, never read as markup, and a prompt is sent with its own bytes.
