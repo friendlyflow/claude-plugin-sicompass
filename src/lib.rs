@@ -37,6 +37,7 @@
 //! conversation state and FFON projection in [`render`].
 
 mod claude_home;
+mod disk_cache;
 mod events;
 mod fsx;
 mod localize;
@@ -843,6 +844,10 @@ impl Plugin for ClaudeProvider {
                 self.on_setting_change(key, &v);
             }
         }
+        // Claude Code's slash commands are read out of its ~300 MB CLI. Start
+        // that now, off this thread, so the first skills palette finds them
+        // ready (it is a small cache read when an earlier process did it).
+        skills::warm_builtin_commands(&self.program);
     }
 
     fn cleanup(&mut self) {

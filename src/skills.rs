@@ -78,7 +78,7 @@ const NOT_INVOCABLE: &[&str] = &[
     "rate-limit-options",
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Skill {
     /// Directory name, which is what a `/name` slash command dispatches on.
     ///
@@ -440,15 +440,29 @@ type BundleKey = (std::path::PathBuf, u64, Option<std::time::SystemTime>);
 /// The extracted command list for one build, or nothing scanned yet.
 type BundleCache = std::sync::Mutex<Option<(BundleKey, Vec<Skill>)>>;
 
+/// The extracted commands' file in the plugin's cache folder.
+const COMMANDS_FILE: &str = "commands.json";
+/// Bump when [`Skill`] or what [`extract_builtin_commands`] finds changes, so a
+/// list extracted by an older plugin is extracted again rather than trusted.
+const COMMANDS_FORMAT: u32 = 1;
+
+/// The extracted command list for the last build asked about, in memory.
+static BUILTIN_COMMANDS: BundleCache = std::sync::Mutex::new(None);
+
 /// Claude Code's own slash commands, read from the installed CLI and cached.
 ///
 /// Keyed on the bundle's path, size and modification time, so an update to the
-/// CLI is picked up on the next palette open and nothing else re-scans.
+/// CLI is picked up on the next palette open and nothing else re-scans. The
+/// cache is in memory and on disk ([`crate::disk_cache`]), so the bundle, some
+/// 300 MB, is read once per Claude Code build rather than once per plugin
+/// process. [`warm_builtin_commands`] does that read in the background when a
+/// tab starts, so the first palette after an update does not wait for it.
 fn builtin_commands(program: &str) -> Vec<Skill> {
     use std::sync::Mutex;
-    use std::sync::OnceLock;
 
-    static CACHE: OnceLock<BundleCache> = OnceLock::new();
+    // Held while a miss is answered, so a palette opened during the background
+    // read waits for it instead of reading the bundle a second time.
+    static FILLING: Mutex<()> = Mutex::new(());
 
     let Some(bundle) = resolve_bundle(program) else {
         return parse_name_list(FALLBACK_BUILTIN_COMMANDS);
@@ -458,21 +472,45 @@ fn builtin_commands(program: &str) -> Vec<Skill> {
         Err(_) => return parse_name_list(FALLBACK_BUILTIN_COMMANDS),
     };
 
-    let cache = CACHE.get_or_init(|| Mutex::new(None));
-    if let Ok(guard) = cache.lock()
-        && let Some((cached_key, cached)) = guard.as_ref()
-        && *cached_key == key
-    {
-        return cached.clone();
+    let cache = &BUILTIN_COMMANDS;
+    let cached = || {
+        cache.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .filter(|(k, _)| *k == key)
+                .map(|(_, c)| c.clone())
+        })
+    };
+    if let Some(found) = cached() {
+        return found;
     }
+    let _filling = FILLING.lock();
+    if let Some(found) = cached() {
+        return found;
+    }
+
+    let extracted =
+        match crate::disk_cache::load::<(BundleKey, Vec<Skill>)>(COMMANDS_FILE, COMMANDS_FORMAT) {
+            Some((saved_key, saved)) if saved_key == key => saved,
+            _ => {
+                let extracted = extract_builtin_commands(&bundle);
+                // An empty scan is not saved: it may be a bundle that could not be
+                // read just now, and it would stand until the next update.
+                if !extracted.is_empty() {
+                    crate::disk_cache::store(COMMANDS_FILE, COMMANDS_FORMAT, &(&key, &extracted));
+                }
+                extracted
+            }
+        };
 
     // Merged, not "extraction *or* fallback": the scan finds most commands but
     // not every one — `doctor`, for instance, is declared in a shape this does
     // not match — and a name the scan misses is still a real command. So the
     // snapshot fills the gaps, and covers the whole list if a future bundle
     // stops matching entirely. Extracted entries win, since they carry the
-    // description.
-    let mut found = extract_builtin_commands(&bundle);
+    // description. (The merge happens after the disk cache, so a new snapshot
+    // in a new plugin reaches a saved list too.)
+    let mut found = extracted;
     let mut seen: HashSet<String> = found.iter().map(|s| s.name.clone()).collect();
     for known in parse_name_list(FALLBACK_BUILTIN_COMMANDS) {
         if seen.insert(known.name.clone()) {
@@ -484,6 +522,22 @@ fn builtin_commands(program: &str) -> Vec<Skill> {
         *guard = Some((key, found.clone()));
     }
     found
+}
+
+/// Fill the slash-command cache on a thread of its own, so the first palette
+/// finds it ready. Cheap when it already is: one `stat` of the bundle and one
+/// small file read. Nothing happens where the palette would list no commands
+/// either (no CLI, or a test).
+pub(crate) fn warm_builtin_commands(program: &str) {
+    if no_ambient_skills() || !cli_exists(program) {
+        return;
+    }
+    let program = program.to_owned();
+    let _ = std::thread::Builder::new()
+        .name("claude-commands".to_owned())
+        .spawn(move || {
+            builtin_commands(&program);
+        });
 }
 
 /// The skills Claude Code ships with, from a comma-separated list.
@@ -1044,6 +1098,88 @@ mod tests {
         let found = extract_builtin_commands(b.path());
         assert_eq!(names(&found), vec!["doctor", "insights"], "sorted");
         assert_eq!(found[1].description, "Analyze your sessions");
+    }
+
+    /// The cache key `builtin_commands` computes for a bundle.
+    fn bundle_key(path: &Path) -> BundleKey {
+        let real = crate::fsx::canonical(path).unwrap();
+        let m = std::fs::metadata(&real).unwrap();
+        (real, m.len(), m.modified().ok())
+    }
+
+    #[test]
+    fn the_commands_read_out_of_a_cli_are_saved_for_the_next_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::disk_cache::_set_test_cache_dir(Some(tmp.path().to_owned()));
+        let b = fake_bundle(r#"{type:"prompt",name:"from-the-bundle",description:"Analyze",x:1}"#);
+        builtin_commands(b.path().to_str().unwrap());
+        let (key, saved) =
+            crate::disk_cache::load::<(BundleKey, Vec<Skill>)>(COMMANDS_FILE, COMMANDS_FORMAT)
+                .expect("saved");
+        assert_eq!(key, bundle_key(b.path()));
+        assert_eq!(
+            names(&saved),
+            vec!["from-the-bundle"],
+            "the extraction, not the merge"
+        );
+        crate::disk_cache::_set_test_cache_dir(None);
+    }
+
+    #[test]
+    fn the_commands_saved_for_this_cli_are_used_without_reading_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::disk_cache::_set_test_cache_dir(Some(tmp.path().to_owned()));
+        let b = fake_bundle(r#"{type:"prompt",name:"from-the-bundle",description:"Analyze",x:1}"#);
+        let saved = vec![Skill {
+            name: "saved-only".to_owned(),
+            description: "from the cache".to_owned(),
+        }];
+        crate::disk_cache::store(
+            COMMANDS_FILE,
+            COMMANDS_FORMAT,
+            &(&bundle_key(b.path()), &saved),
+        );
+        let found = builtin_commands(b.path().to_str().unwrap());
+        let found = names(&found);
+        assert!(found.contains(&"saved-only"), "the saved list is used");
+        assert!(
+            !found.contains(&"from-the-bundle"),
+            "the bundle was not read"
+        );
+        assert!(found.contains(&"help"), "the snapshot still fills the gaps");
+        crate::disk_cache::_set_test_cache_dir(None);
+    }
+
+    #[test]
+    fn commands_saved_for_another_build_are_read_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::disk_cache::_set_test_cache_dir(Some(tmp.path().to_owned()));
+        let b = fake_bundle(r#"{type:"prompt",name:"from-the-bundle",description:"Analyze",x:1}"#);
+        let (path, len, modified) = bundle_key(b.path());
+        let saved = vec![Skill {
+            name: "saved-only".to_owned(),
+            description: String::new(),
+        }];
+        let older: BundleKey = (path, len + 1, modified);
+        crate::disk_cache::store(COMMANDS_FILE, COMMANDS_FORMAT, &(&older, &saved));
+        let found = builtin_commands(b.path().to_str().unwrap());
+        let found = names(&found);
+        assert!(found.contains(&"from-the-bundle"));
+        assert!(!found.contains(&"saved-only"));
+        crate::disk_cache::_set_test_cache_dir(None);
+    }
+
+    #[test]
+    fn an_empty_scan_is_not_saved() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::disk_cache::_set_test_cache_dir(Some(tmp.path().to_owned()));
+        let b = fake_bundle("nothing that looks like a command");
+        builtin_commands(b.path().to_str().unwrap());
+        assert!(
+            crate::disk_cache::load::<(BundleKey, Vec<Skill>)>(COMMANDS_FILE, COMMANDS_FORMAT)
+                .is_none()
+        );
+        crate::disk_cache::_set_test_cache_dir(None);
     }
 
     #[test]

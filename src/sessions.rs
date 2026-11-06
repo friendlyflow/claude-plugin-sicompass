@@ -36,7 +36,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::events::{ApiMessage, ContentBlock};
 use crate::render::Conversation;
@@ -143,7 +143,7 @@ struct DiskRecord {
 }
 
 /// One past session, as much as the list needs to know about it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SessionMeta {
     /// The session uuid — the file stem, and what `--resume` takes.
     pub id: String,
@@ -363,10 +363,23 @@ fn read_meta(path: &Path, modified: SystemTime, len: u64) -> Option<SessionMeta>
 /// Appending a turn changes both, and the title can only change by appending, so
 /// the pair is a complete validity test and a rebuilt list costs one `stat` per
 /// transcript.
+///
+/// It is also kept on disk ([`crate::disk_cache`]), so a new plugin process
+/// starts from what the last one read instead of from every transcript.
 #[derive(Debug, Default)]
 pub(crate) struct SessionIndex {
     entries: HashMap<PathBuf, (SystemTime, u64, SessionMeta)>,
+    /// Whether the file on disk has been read into `entries` yet.
+    loaded: bool,
+    /// Whether `entries` holds something the file on disk does not.
+    dirty: bool,
 }
+
+/// The session index's file in the plugin's cache folder.
+const INDEX_FILE: &str = "sessions.json";
+/// Bump when [`SessionMeta`] or what [`read_meta`] puts in it changes, so an
+/// index written by an older plugin is read again rather than trusted.
+const INDEX_FORMAT: u32 = 1;
 
 impl SessionIndex {
     fn get(&mut self, path: &Path, modified: SystemTime, len: u64) -> Option<SessionMeta> {
@@ -379,12 +392,49 @@ impl SessionIndex {
         let meta = read_meta(path, modified, len)?;
         self.entries
             .insert(path.to_owned(), (modified, len, meta.clone()));
+        self.dirty = true;
         Some(meta)
     }
 
     /// Forget one file, so a deleted transcript cannot linger in a later list.
     pub(crate) fn forget(&mut self, path: &Path) {
-        self.entries.remove(path);
+        if self.entries.remove(path).is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Read the index the last process saved, once. Entries this process has
+    /// already read win, since they are at least as recent.
+    fn load(&mut self) {
+        if self.loaded {
+            return;
+        }
+        self.loaded = true;
+        let Some(saved) = crate::disk_cache::load::<Vec<(SystemTime, u64, SessionMeta)>>(
+            INDEX_FILE,
+            INDEX_FORMAT,
+        ) else {
+            return;
+        };
+        for (modified, len, meta) in saved {
+            self.entries
+                .entry(meta.path.clone())
+                .or_insert((modified, len, meta));
+        }
+    }
+
+    /// Write the index back when this process read something new, leaving out
+    /// transcripts that no longer exist.
+    fn save(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
+        self.entries.retain(|path, _| path.exists());
+        let mut saved: Vec<&(SystemTime, u64, SessionMeta)> = self.entries.values().collect();
+        // A stable order, so an unchanged index writes the same bytes.
+        saved.sort_by(|a, b| a.2.path.cmp(&b.2.path));
+        crate::disk_cache::store(INDEX_FILE, INDEX_FORMAT, &saved);
     }
 }
 
@@ -399,6 +449,7 @@ pub(crate) fn scan_in(root: &Path, folder: &Path, index: &mut SessionIndex) -> V
     let Ok(dirs) = std::fs::read_dir(root) else {
         return out;
     };
+    index.load();
     for dir in dirs.flatten() {
         let name = dir.file_name().to_string_lossy().into_owned();
         // Prefix-preserving, so this filter has no false negatives. Its false
@@ -428,6 +479,7 @@ pub(crate) fn scan_in(root: &Path, folder: &Path, index: &mut SessionIndex) -> V
             out.push(session);
         }
     }
+    index.save();
     out.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.id.cmp(&b.id)));
     out
 }
@@ -832,6 +884,81 @@ mod tests {
             scan_in(root, Path::new("/t/p"), &mut idx)[0].label(),
             Some("Rewrites")
         );
+    }
+
+    #[test]
+    fn a_new_index_starts_from_the_one_saved_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        crate::disk_cache::_set_test_cache_dir(Some(tmp.path().join("cache")));
+        let p = simple(&root, "-t-p", "ddd", "/t/p", "first", Some("Original"));
+        set_mtime(&p, 100);
+        let gone = simple(&root, "-t-p", "eee", "/t/p", "second", Some("Gone"));
+        assert_eq!(
+            scan_in(&root, Path::new("/t/p"), &mut SessionIndex::default()).len(),
+            2
+        );
+
+        // The same trick as above: same length, same mtime, another title on
+        // disk. A fresh index, as a new plugin process has, still serves the
+        // saved title, so the transcript was not read again.
+        let original = std::fs::read_to_string(&p).unwrap();
+        std::fs::write(&p, original.replace("Original", "Rewrites")).unwrap();
+        set_mtime(&p, 100);
+        std::fs::remove_file(&gone).unwrap();
+        let mut fresh = SessionIndex::default();
+        let got = scan_in(&root, Path::new("/t/p"), &mut fresh);
+        assert_eq!(
+            got.iter().map(|s| s.label()).collect::<Vec<_>>(),
+            vec![Some("Original")],
+            "served from the saved index, and the deleted transcript is not listed"
+        );
+
+        // A changed transcript is read again, and what is saved then no longer
+        // holds the deleted one.
+        set_mtime(&p, 10);
+        let mut fresh = SessionIndex::default();
+        assert_eq!(
+            scan_in(&root, Path::new("/t/p"), &mut fresh)[0].label(),
+            Some("Rewrites")
+        );
+        let saved = crate::disk_cache::load::<Vec<(SystemTime, u64, SessionMeta)>>(
+            INDEX_FILE,
+            INDEX_FORMAT,
+        )
+        .unwrap();
+        assert_eq!(
+            saved.iter().map(|e| e.2.id.as_str()).collect::<Vec<_>>(),
+            vec!["ddd"]
+        );
+        crate::disk_cache::_set_test_cache_dir(None);
+    }
+
+    #[test]
+    fn an_index_of_another_format_is_not_trusted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        crate::disk_cache::_set_test_cache_dir(Some(tmp.path().join("cache")));
+        let p = simple(&root, "-t-p", "fff", "/t/p", "first", Some("Original"));
+        set_mtime(&p, 100);
+        scan_in(&root, Path::new("/t/p"), &mut SessionIndex::default());
+
+        // Rewrite the saved index under an older format number.
+        let saved = crate::disk_cache::load::<Vec<(SystemTime, u64, SessionMeta)>>(
+            INDEX_FILE,
+            INDEX_FORMAT,
+        )
+        .unwrap();
+        crate::disk_cache::store(INDEX_FILE, INDEX_FORMAT - 1, &saved);
+        let original = std::fs::read_to_string(&p).unwrap();
+        std::fs::write(&p, original.replace("Original", "Rewrites")).unwrap();
+        set_mtime(&p, 100);
+        assert_eq!(
+            scan_in(&root, Path::new("/t/p"), &mut SessionIndex::default())[0].label(),
+            Some("Rewrites"),
+            "the transcript was read, not the old index"
+        );
+        crate::disk_cache::_set_test_cache_dir(None);
     }
 
     #[test]
