@@ -9,8 +9,9 @@ Claude starts on a folder listing. Walk to a project and press : for its
 sessions, the ones run in that folder and below it. Right on one resumes it, and
 new session starts a fresh one. The conversation is a list of rows: your
 prompts, Claude's answers, every tool call and its result. i on the last row
-types the next prompt, and a second : lists the project's skills and Claude
-Code's slash commands to insert.
+types the next prompt. A second : writes one from the project's skills, Claude
+Code's slash commands and your earlier prompts: Tab completes, and Enter puts
+the prompt in the last row.
 
 It drives the `claude` command line tool you already have, with the login that
 tool already has, so there is no key to paste here. Install Claude Code first.

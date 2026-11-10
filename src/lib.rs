@@ -52,7 +52,9 @@ use sessions::_set_test_projects_root;
 
 use std::path::{Path, PathBuf};
 
-use sicompass_sdk::plugin::{Descriptor, FfonElement, ListItem, Plugin, PollResult};
+use sicompass_sdk::plugin::{
+    COMPOSE_COMMAND, Completions, Descriptor, FfonElement, ListItem, Plugin, PollResult,
+};
 
 use render::Conversation;
 use session::{Session, SessionConfig};
@@ -114,17 +116,6 @@ const SESSION_LABEL_CHARS: usize = 120;
 /// app keeps (Escape unwinds modes, Left unwinds one level).
 pub const CMD_BROWSE: &str = "browse";
 
-/// Command id: list the Claude Code skills the running session can invoke.
-///
-/// Unlike the view swaps above this is *not* one. The app fills the prompt with
-/// `/name` and the session view stays exactly as it was, which is why it needs
-/// no [`View`] variant of its own.
-///
-/// That restriction is about commands which are not view swaps. The session list
-/// *is* one, it is inside the same escape-only layer, and it does answer yes to
-/// the app's "is this the session view?" test, so it earns a variant.
-pub const CMD_SKILLS: &str = "skills";
-
 /// Which list the provider is currently serving from `fetch()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum View {
@@ -180,17 +171,13 @@ pub struct ClaudeProvider {
     /// deliberately when we *want* a re-spawn (after an unexpected child exit).
     init_attempted: bool,
     convo: Conversation,
-    /// Past prompts, oldest first — recall history for the input slot.
+    /// Past prompts, oldest first, offered as the lines of second command mode.
     history: Vec<String>,
     /// Value rendered inside the live `<input>` slot on the next `fetch()`.
     pending_input: String,
-    /// Skills found by the last `handle_command(CMD_SKILLS)`.
-    ///
-    /// Cached rather than scanned on demand because `command_list_items` takes
-    /// `&self` and the app rebuilds the palette list on every keystroke of its
-    /// type-to-filter — a `read_dir` there would run twice per character typed.
-    /// Refreshed on every palette open, so a skill added while the app is
-    /// running shows up the next time `:` is pressed.
+    /// Skills found the last time second command mode opened
+    /// (`compose_completions`). Read again each time it opens, so a skill
+    /// added while the app is running shows up the next time `:` is pressed.
     skills: Vec<skills::Skill>,
     /// Last `session_id` seen — used for `--resume` on re-spawn.
     last_session_id: Option<String>,
@@ -666,6 +653,44 @@ impl ClaudeProvider {
         changed
     }
 
+    /// What second command mode offers in a session: the skills the session
+    /// can invoke, inserted as `/name`, then the prompts sent before, newest
+    /// first and each once. Nothing outside a session, which has no prompt.
+    ///
+    /// The skills are read again each time, from `session_path` rather than
+    /// `browse_path`: `claude` reads `.claude/skills/` from the directory it was
+    /// *spawned* in. It is assigned before the spawn is attempted, so this is
+    /// right even when the spawn failed.
+    fn compose_completions(&mut self) -> Completions {
+        if self.view != View::Session {
+            return Completions::default();
+        }
+        self.skills = skills::discover(&self.session_path, &self.program);
+        let words = self
+            .skills
+            .iter()
+            .map(|s| ListItem {
+                // The `/` in the label too, so typing `/rev` finds `/review`.
+                // `data` is the text written into the line: the app knows
+                // nothing about skills.
+                label: format!("/{}", s.label()),
+                data: format!("/{}", s.name),
+            })
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let lines = self
+            .history
+            .iter()
+            .rev()
+            .filter(|p| seen.insert(p.as_str()))
+            .map(|p| ListItem {
+                label: p.clone(),
+                data: p.clone(),
+            })
+            .collect();
+        Completions { words, lines }
+    }
+
     fn record_history(&mut self, prompt: &str) {
         self.history.push(prompt.to_owned());
         if self.history.len() > HISTORY_CAP {
@@ -764,22 +789,6 @@ impl ClaudeProvider {
             }
             CMD_ACTIVATE_ROW => return self.activate_row(element_key),
             CMD_BROWSE => self.leave_session(),
-            CMD_SKILLS => {
-                // Scanned here, in the `&mut self` hook, because
-                // `command_list_items` is `&self` and the app calls it on every
-                // list rebuild.
-                //
-                // `session_path` rather than `browse_path`: `claude` reads
-                // `.claude/skills/` from the directory it was *spawned* in. It
-                // is assigned before the spawn is attempted, so this is right
-                // even when the spawn failed.
-                //
-                // Deliberately never writes `*error`: the caller rebuilds the
-                // list immediately afterwards, and that clears `error_message`,
-                // so anything reported here would vanish. Discovery is
-                // silent-skip by construction, so there is nothing to report.
-                self.skills = skills::discover(&self.session_path, &self.program);
-            }
             _ => {}
         }
         // No element to insert and no error: the app treats this as a state
@@ -940,8 +949,9 @@ impl Plugin for ClaudeProvider {
         self.send_prompt(&prompt)
     }
 
-    /// A restored `<input>` arrives raw and text from the insert palette plain.
-    /// `pending_input` is always plain, which `render::build` escapes again.
+    /// A restored `<input>` and the line written in second command mode arrive
+    /// raw, as the row holds them. `pending_input` is always plain, which
+    /// `render::build` escapes again.
     fn set_input_value(&mut self, value: &str) {
         if !render::slot_reads_back_as(value, &self.pending_input) {
             self.pending_input = render::unescape_markup(value);
@@ -956,7 +966,9 @@ impl Plugin for ClaudeProvider {
     // plugin channel and the tests reach the provider through the generic command
     // path, and `commands()` is what tells the app which of the two transitions
     // is currently available — that is how the app decides whether `:` should
-    // enter or leave the session without querying view state.
+    // enter or leave the session without querying view state. In a session,
+    // `:` opens second command mode instead (`COMPOSE_COMMAND`, answered by
+    // `completions`).
 
     /// `CMD_BROWSE` stays **first** in the session arm. The app reads
     /// "am I in the session view?" as "does this contain `browse`?", which is
@@ -968,12 +980,17 @@ impl Plugin for ClaudeProvider {
         match self.view {
             View::Browse => vec![CMD_SESSIONS.to_owned()],
             View::Sessions => vec![CMD_BROWSE.to_owned(), CMD_SESSIONS.to_owned()],
+            // `compose`: `:` in a session writes a line for the prompt.
             View::Session => vec![
                 CMD_BROWSE.to_owned(),
                 CMD_SESSIONS.to_owned(),
-                CMD_SKILLS.to_owned(),
+                COMPOSE_COMMAND.to_owned(),
             ],
         }
+    }
+
+    fn completions(&mut self) -> Completions {
+        self.compose_completions()
     }
 
     fn command_label(&self, cmd: &str) -> String {
@@ -982,7 +999,7 @@ impl Plugin for ClaudeProvider {
             CMD_SESSIONS => localize::t("claude-command-sessions"),
             CMD_DELETE_SESSION => localize::t("claude-command-delete-session"),
             CMD_BROWSE => localize::t("claude-command-browse"),
-            CMD_SKILLS => localize::t("claude-command-skills"),
+            COMPOSE_COMMAND => localize::t("claude-command-compose"),
             other => other.to_owned(),
         }
     }
@@ -1001,40 +1018,6 @@ impl Plugin for ClaudeProvider {
         } else {
             Err(error)
         }
-    }
-
-    fn command_list_items(&self, command: &str) -> Vec<ListItem> {
-        if command != CMD_SKILLS {
-            return Vec::new();
-        }
-        self.skills
-            .iter()
-            .map(|s| ListItem {
-                // Human text in `label`, payload in `data` — the shape the file
-                // browser's "open file with" uses.
-                //
-                // `data` is the text to insert, not the bare name: the app
-                // splices it into the live input slot verbatim and knows nothing
-                // about skills. The leading `/` belongs here, where the fact
-                // that a skill is invoked as a slash command is known.
-                label: s.label(),
-                data: format!("/{}", s.name),
-            })
-            .collect()
-    }
-
-    fn execute_command(&mut self, command: &str, selection: &str) -> bool {
-        if command != CMD_SKILLS || selection.is_empty() {
-            return false;
-        }
-        // Not on the hot path: the app owns the FFON and splices the selection
-        // into the input slot itself, so the `:` palette never reaches here.
-        // Implemented so the generic command route — the plugin channel, and any
-        // test driving the provider through the SDK trait — is not a silent
-        // no-op. `selection` is already the full insert text (`/name`), and
-        // appending rather than replacing matches the app-side behaviour.
-        self.pending_input.push_str(selection);
-        true
     }
 
     fn on_setting_change(&mut self, key: &str, value: &str) {
@@ -1459,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn the_session_view_offers_the_view_swap_before_the_skills() {
+    fn the_session_view_offers_the_view_swap_before_compose() {
         // The app reads "am I in the session view?" as "does this offer
         // `browse`?", and the one caller that takes the first entry is only
         // safe because it early-returns in a session. Leading with the swap
@@ -1479,7 +1462,7 @@ mod tests {
             vec![
                 CMD_BROWSE.to_owned(),
                 CMD_SESSIONS.to_owned(),
-                CMD_SKILLS.to_owned()
+                COMPOSE_COMMAND.to_owned()
             ],
             "the session also advertises the list, so the app knows Left has \
              somewhere to go without being told which provider this is"
@@ -1501,20 +1484,24 @@ mod tests {
     }
 
     #[test]
-    fn handle_command_skills_fills_the_cache_and_reports_nothing() {
+    fn the_words_of_second_command_mode_are_the_skills_as_slash_commands() {
+        // `data` is what the app writes into the line, verbatim, so the leading
+        // `/` lives here, not in the app. The label has it too, so `/rev` finds
+        // the row.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         project_skill(&root, "review", "---\ndescription: Review the diff\n---\n");
 
         let mut p = browsing(&root);
         p.start_new_session();
-        let mut err = String::new();
-        let out = p.handle_command(CMD_SKILLS, "", 0, &mut err);
-
-        assert!(out.is_none(), "not an element-insert command");
-        assert!(err.is_empty(), "an error here would be silently discarded");
-        assert_eq!(p.skills.len(), 1);
-        assert_eq!(p.skills[0].name, "review");
+        let c = p.compose_completions();
+        assert_eq!(
+            c.words,
+            [ListItem {
+                label: "/review - Review the diff".to_owned(),
+                data: "/review".to_owned(),
+            }]
+        );
     }
 
     #[test]
@@ -1532,54 +1519,39 @@ mod tests {
         p.push_path("workspace");
         p.start_new_session();
         assert!(p.session.is_none(), "the bogus binary cannot spawn");
-        p.handle_command(CMD_SKILLS, "", 0, &mut String::new());
-        assert_eq!(p.skills.len(), 1, "found despite the failed spawn");
+        let words = p.compose_completions().words;
+        assert_eq!(words.len(), 1, "found despite the failed spawn");
+        assert_eq!(words[0].data, "/deep");
     }
 
     #[test]
-    fn command_list_items_carry_the_insert_text_in_data() {
-        // `data` is what the app splices into the input slot, verbatim — so the
-        // leading `/` lives here, not in the app.
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        project_skill(&root, "review", "---\ndescription: Review the diff\n---\n");
-
-        let mut p = browsing(&root);
-        p.start_new_session();
-        p.handle_command(CMD_SKILLS, "", 0, &mut String::new());
-
-        let items = p.command_list_items(CMD_SKILLS);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].data, "/review");
-        assert_eq!(items[0].label, "review - Review the diff");
-    }
-
-    #[test]
-    fn command_list_items_is_empty_for_other_commands() {
+    fn the_lines_of_second_command_mode_are_the_prompts_sent_newest_first() {
         let mut p = ClaudeProvider::new();
         p.view = View::Session;
-        assert!(p.command_list_items(CMD_BROWSE).is_empty());
-        assert!(p.command_list_items("nonsense").is_empty());
+        p.record_history("first");
+        p.record_history("second");
+        p.record_history("first");
+        let lines: Vec<String> = p
+            .compose_completions()
+            .lines
+            .into_iter()
+            .map(|l| l.data)
+            .collect();
+        assert_eq!(
+            lines,
+            ["first", "second"],
+            "the newest of each, newest first"
+        );
     }
 
     #[test]
-    fn execute_command_appends_the_selection_to_the_prompt() {
+    fn second_command_mode_offers_nothing_outside_a_session() {
         let mut p = ClaudeProvider::new();
-        p.view = View::Session;
-        p.pending_input = "explain ".to_owned();
-        assert!(p.execute_command(CMD_SKILLS, "/review"));
-        assert_eq!(p.pending_input, "explain /review");
-        // And it reaches the rendered slot.
-        let out = render::build(&p.convo, &p.pending_input);
-        assert!(slot_key(&out).contains("<input>explain /review</input>"));
-    }
-
-    #[test]
-    fn execute_command_ignores_other_commands_and_empty_selections() {
-        let mut p = ClaudeProvider::new();
-        assert!(!p.execute_command(CMD_BROWSE, "/review"));
-        assert!(!p.execute_command(CMD_SKILLS, ""));
-        assert!(p.pending_input.is_empty());
+        p.record_history("a question");
+        for view in [View::Browse, View::Sessions] {
+            p.view = view;
+            assert_eq!(p.compose_completions(), Completions::default(), "{view:?}");
+        }
     }
 
     #[test]
@@ -1862,8 +1834,8 @@ mod tests {
         );
         assert_eq!(p.current_path(), root.to_str().unwrap());
         assert!(
-            p.commands().iter().any(|c| c == CMD_SKILLS),
-            "the skills are on offer while the first prompt is typed"
+            p.commands().iter().any(|c| c == COMPOSE_COMMAND),
+            "a prompt can be written with the skills before the first is sent"
         );
         let out = p.fetch();
         assert!(

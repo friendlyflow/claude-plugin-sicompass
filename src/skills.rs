@@ -1,6 +1,6 @@
 //! Discovery of the Claude Code skills a session can invoke.
 //!
-//! Five sources, in the order the palette shows them: the user's own
+//! Five sources, in the order second command mode shows them: the user's own
 //! `~/.claude/skills/`, the session folder's `.claude/skills/`, the `skills/`
 //! directories of *enabled* marketplace plugins, the skills Claude Code ships
 //! with, and its own slash commands. The first three are directories holding a
@@ -91,7 +91,7 @@ pub(crate) struct Skill {
 }
 
 impl Skill {
-    /// The palette row.
+    /// The row second command mode shows, after a `/`.
     ///
     /// Name first so a prefix search finds it, description after so the app's
     /// fuzzy filter — which matches on this whole string — also finds a skill by
@@ -122,7 +122,7 @@ impl Skill {
 //
 // The shipped built-ins are covered too. They are not on disk, but they are just
 // as much "whatever this Claude Code has" as the rest, and leaving them on would
-// pad every palette assertion with rows the test did not create.
+// pad every completion assertion with rows the test did not create.
 // * The app's integration tests are a different binary, where this crate is
 //   compiled *without* `cfg(test)` and the provider is reached as a
 //   `Box<dyn Provider>`. They call `_set_test_no_ambient_skills(true)` once.
@@ -143,7 +143,7 @@ fn no_ambient_skills() -> bool {
 
 /// Skills visible to a session running in `session_path`.
 ///
-/// Five sources, in the order the palette shows them:
+/// Five sources, in the order second command mode shows them:
 ///
 /// 1. `~/.claude/skills/` — personal, available in every project.
 /// 2. `<session folder>/.claude/skills/` — this project's own.
@@ -155,7 +155,7 @@ fn no_ambient_skills() -> bool {
 /// [`discover_in`] for the injectable form the tests use. The personal and
 /// plugin skills need that folder. The built-in skills and the slash commands
 /// belong to the CLI, so they are listed only when `program` can be found: a
-/// palette of commands for a Claude Code that is not there helps nobody. (It
+/// list of commands for a Claude Code that is not there helps nobody. (It
 /// is also what keeps a test harness that lets the plugin start no `claude`
 /// to the project's own skills.)
 pub(crate) fn discover(session_path: &str, program: &str) -> Vec<Skill> {
@@ -203,7 +203,7 @@ pub(crate) fn discover(session_path: &str, program: &str) -> Vec<Skill> {
 /// list read top to bottom would be lying.
 ///
 /// Caveat worth knowing: Claude Code itself resolves a colliding `/name` to the
-/// **project** skill. Since the palette only ever inserts `/name`, the
+/// **project** skill. Since second command mode only ever writes `/name`, the
 /// invocation is identical either way — only the description shown differs.
 pub(crate) fn discover_in(
     personal: &Path,

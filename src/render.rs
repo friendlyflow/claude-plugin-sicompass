@@ -534,8 +534,8 @@ pub fn build(convo: &Conversation, pending_input: &str) -> Vec<FfonElement> {
 
     // --- live input slot -------------------------------------------------
     // A `-i` Str: an `<input>` with nothing under it, so it reads as the leaf
-    // it is. Recall history as `<button>` children is still to come; when it
-    // lands this becomes a `+i` Obj on the turns that have any.
+    // it is. Earlier prompts are offered by second command mode
+    // (`completions`), not under the slot.
     //
     // The prompt prefix ends in `: ` so the typed text reads as following a
     // label, the way the terminal's `user@host:~$ ` prompt does, rather than
