@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.4
+
+- A second colon in a session writes a prompt: the project's skills first, then the prompts you sent before. Tab completes the skill you are typing, and Enter puts the prompt in the input line, where Enter sends it. It replaces the skills list.
+- Needs sicompass 0.2.6.
+
 ## 0.3.3
 
 - The session list and the skills list appear at once. They used to be read again every time the plugin started, which took several seconds after an update: the transcripts for the session list, and the whole Claude Code program for its slash commands. The plugin now keeps what it read in its own folder, and reads the commands in the background when a tab opens.
